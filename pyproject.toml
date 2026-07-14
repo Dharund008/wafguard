@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cf-waf-validator"
+version = "1.0.0"
+description = "Cloudflare WAF Validation Framework — discovers WAF rules, exercises them with targeted payloads, correlates against firewall events, and renders an evidence-backed report."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "AP Infrastructure / Presidio" }]
+dependencies = [
+    "requests>=2.31.0",
+    "PyYAML>=6.0",
+    "Jinja2>=3.1.0",
+]
+
+[project.scripts]
+waf-validator = "waf_validator:main"
+
+[tool.setuptools]
+py-modules = ["waf_validator"]
+
+[tool.setuptools.packages.find]
+include = ["engine*"]

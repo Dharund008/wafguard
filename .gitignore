@@ -1,0 +1,7 @@
+# Sensitive files
+.env
+zones/*.yaml
+
+# RunNotes
+notes.txt
+notes.md

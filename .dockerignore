@@ -1,0 +1,10 @@
+reports/
+zones/*.yaml
+!zones/.gitkeep
+__pycache__/
+*.pyc
+.git/
+.venv/
+*.egg-info/
+build/
+dist/

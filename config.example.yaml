@@ -1,0 +1,46 @@
+# ===== Cloudflare WAF Validation Framework — Zone Config =====
+# Copy this file to zones/<zone>.yaml and fill in the values.
+
+zone:
+  name: aptechdevlab.com
+  zone_id: "654c921dfe0f5347ba16235f925137e5"
+  account_id: "your-account-id"          # required only for IP-list reads
+
+api:
+  token_env: "CF_API_TOKEN"              # name of the env var holding the token
+
+targets:
+  - hostname: pronto.aptechdevlab.com
+    protocol: https
+    test_paths:
+      default: /
+      api: /api/v1/health
+  # Add a services-* host to exercise the content-type / API-traffic adapters:
+  # - hostname: services-us-east-1.aptechdevlab.com
+  #   protocol: https
+  #   test_paths:
+  #     default: /
+
+# Optional: source IPs that belong to the named lists. Supplying these makes
+# the IP-list rules auto-testable (the runner must egress from that IP).
+test_ips:
+  whitelisted: null                      # IP in $ap_whitelist
+  blocked: null                          # IP in $ap_blacklist
+  bypass: null                           # IP in $ap_bypasslist
+  rate_bypass: null                      # IP in $ap_ratecontrol_bypass
+
+options:
+  request_timeout: 10                    # seconds per request
+  rate_limit_buffer: 2                   # extra requests beyond the threshold
+  event_poll_delay: 5                    # seconds to wait before querying events
+  event_poll_retries: 3                  # event-fetch retry attempts
+  event_poll_interval: 5                 # seconds between event-fetch retries
+  verify_ssl: true                       # TLS verification for target requests
+  user_agent: "AP-WAF-Validator/1.0"
+  inter_request_delay: 0.0               # seconds between rate-limit loop requests
+  socks_proxy: null                      # e.g. socks5h://127.0.0.1:9050 for geo tests
+
+output:
+  format: html                           # html | json | both
+  directory: ./reports
+  filename_template: "waf_validation_{zone}_{hostname}_{date}_{time}"

@@ -1,0 +1,2 @@
+[console_scripts]
+waf-validator = waf_validator:main

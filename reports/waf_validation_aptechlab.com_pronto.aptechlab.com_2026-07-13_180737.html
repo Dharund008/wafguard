@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WAF Validation Report — aptechlab.com / pronto.aptechlab.com</title>
+<style>
+  :root {
+    --bg: #0f1117; --card: #181b23; --card2: #1f232d; --border: #2a2f3a;
+    --text: #e6e8ec; --muted: #9aa2b1; --accent: #6ea8fe;
+    --pass: #3fb950; --fail: #f85149; --manual: #d29922; --skip: #58a6ff;
+    --pass-bg: #12261a; --fail-bg: #2a1315; --manual-bg: #2a230f;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.5; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 32px 24px 64px; }
+  header { border-bottom: 1px solid var(--border); padding-bottom: 20px; margin-bottom: 28px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 32px 0 14px; }
+  .meta { color: var(--muted); font-size: 13px; }
+  .meta code { color: var(--text); background: var(--card2); padding: 1px 6px; border-radius: 4px; }
+  .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin: 24px 0; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px; }
+  .card .n { font-size: 30px; font-weight: 700; }
+  .card .l { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .card.pass .n { color: var(--pass); } .card.fail .n { color: var(--fail); }
+  .card.manual .n { color: var(--manual); } .card.cov .n { color: var(--accent); }
+  .bar { height: 8px; border-radius: 5px; background: var(--card2); overflow: hidden; margin-top: 12px; display: flex; }
+  .bar span { display: block; height: 100%; }
+  .cov-tree { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px 20px; font-size: 14px; }
+  .cov-tree div { padding: 3px 0; color: var(--muted); }
+  .cov-tree b { color: var(--text); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-weight: 600; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  td { padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tr.rowhead { cursor: pointer; }
+  tr.rowhead:hover td { background: var(--card2); }
+  .badge { display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+  .badge.PASS { color: var(--pass); background: var(--pass-bg); }
+  .badge.FAIL { color: var(--fail); background: var(--fail-bg); }
+  .badge.MANUAL { color: var(--manual); background: var(--manual-bg); }
+  .badge.ERROR { color: var(--fail); background: var(--fail-bg); }
+  .detail { display: none; }
+  .detail.open { display: table-row; }
+  .detail td { background: var(--card2); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; white-space: pre-wrap; color: var(--muted); }
+  .chk { list-style: none; padding: 0; }
+  .chk li { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
+  .chk .rn { font-weight: 600; color: var(--text); }
+  .chk .st { color: var(--muted); font-size: 13px; margin-top: 3px; }
+  .rec { background: var(--card); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; font-size: 14px; }
+  .rec.warn { border-left-color: var(--manual); }
+  .rec.err { border-left-color: var(--fail); }
+  .muted { color: var(--muted); }
+  .tag { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); }
+  footer { margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Cloudflare WAF Validation Report</h1>
+    <div class="meta">
+      Zone <code>aptechlab.com</code> &nbsp;·&nbsp; Target <code>pronto.aptechlab.com</code>
+      &nbsp;·&nbsp; 2026-07-13 18:07 UTC &nbsp;·&nbsp; WAF Validation Framework v1.0
+      &nbsp;·&nbsp; API connected
+    </div>
+  </header>
+
+  <section class="cards">
+    <div class="card pass"><div class="n">2</div><div class="l">Passed</div></div>
+    <div class="card fail"><div class="n">1</div><div class="l">Failed</div></div>
+    <div class="card manual"><div class="n">10</div><div class="l">Manual</div></div>
+    <div class="card cov"><div class="n">23%</div><div class="l">Auto coverage</div></div>
+  </section>
+
+  <div class="bar">
+    <span style="width: 15%; background: var(--pass);"></span>
+    <span style="width: 8%; background: var(--fail);"></span>
+    <span style="width: 77%; background: var(--manual);"></span>
+  </div>
+
+  <h2>Coverage breakdown</h2>
+  <div class="cov-tree">
+    <div>Rules discovered: <b>19</b></div>
+    <div>├── Enabled: <b>18</b></div>
+    <div>│&nbsp;&nbsp;&nbsp;├── Auto-testable: <b>18</b></div>
+    <div>│&nbsp;&nbsp;&nbsp;└── Manual / partial: <b>10</b></div>
+    <div>├── Disabled (excluded): <b>1</b></div>
+    <div>└── Unclassified: <b>1</b></div>
+  </div>
+
+  <h2>Rule-by-rule results</h2>
+  <table>
+    <thead>
+      <tr><th>#</th><th>Rule</th><th>Phase</th><th>Type</th><th>Expected</th><th>Verdict</th></tr>
+    </thead>
+    <tbody>
+      
+      <tr class="rowhead" onclick="toggle('d1')">
+        <td>1</td>
+        <td>AP WhiteList</td>
+        <td class="tag">custom</td>
+        <td class="tag">ip_whitelist</td>
+        <td class="tag">skip</td>
+        <td><span class="badge MANUAL">MANUAL</span></td>
+      </tr>
+      <tr class="detail" id="d1">
+        <td colspan="6">Verdict:        MANUAL
+Details:        No test IP configured for $ap_whitelist. Set test_ips.whitelisted in the config (an IP that is a member of $ap_whitelist), or verify this rule manually by sending a request from such an IP and confirming the 'skip' action in the event stream.
+Adapter:        ip_list
+Match method:   preflight
+Expected action:skip
+Observed action:—
+Payloads:       (no payloads sent)
+CF-Ray IDs:     —
+Matched events: —</td>
+      </tr>
+      
+      <tr class="rowhead" onclick="toggle('d2')">
+        <td>2</td>
+        <td>AP BypassList</td>
+        <td class="tag">custom</td>
+        <td class="tag">ip_bypass</td>
+        <td class="tag">skip</td>
+        <td><span class="badge MANUAL">MANUAL</span></td>
+      </tr>
+      <tr class="detail" id="d2">
+        <td colspan="6">Verdict:        MANUAL
+Details:        No test IP configured for $ap_bypasslist. Set test_ips.bypass in the config (an IP that is a member of $ap_bypasslist), or verify this rule manually by sending a request from such an IP and confirming the 'skip' action in the event stream.
+Adapter:        ip_list
+Match method:   preflight
+Expected action:skip
+Observed action:—
+Payloads:       (no payloads sent)
+CF-Ray IDs:     —
+Matched events: —</td>
+      </tr>
+      
+      <tr class="rowhead" onclick="toggle('d3')">
+        <td>3</td>
+        <td>AP BypassRateLimitList</td>
+        <td class="tag">custom</td>
+        <td class="tag">rate_bypass</td>
+        <td class="tag">skip</td>
+        <td><span class="badge MANUAL">MANUAL</span></td>
+      </tr>
+      <tr class="detail" id="d3">
+        <td colspan="6">Verdict:        MANUAL
+Details:        No test IP configured for $ap_ratecontrol_bypass. Set test_ips.rate_bypass in the config (an IP that is a member of $ap_ratecontrol_bypass), or verify this rule manually by sending a request from such an IP and confirming the 'skip' action in the event stream.
+Adapter:        ip_list
+Match method:   preflight
+Expected action:skip
+Observed action:—
+Payloads:       (no payloads sent)
+CF-Ray IDs:     —
+Matched events: —</td>
+      </tr>
+      
+      <tr class="rowhead" onclick="toggle('d4')">
+        <td>4</td>
+        <td>AP BlockList</td>
+        <td class="tag">custom</td>
+        <td class="tag">ip_blocklist</td>
+        <td class="tag">block</td>
+        <td><span class="badge MANUAL">MANUAL</span></td>
+      </tr>
+      <tr class="detail" id="d4">
+        <td colspan="6">Verdict:        MANUAL
+Details:        No test IP configured for $ap_blacklist. Set test_ips.blocked in the config (an IP that is a member of $ap_blacklist), or verify this rule manually by sending a request from such an IP and confirming the 'block' action in the event stream.
+Adapter:        ip_list
+Match method:   preflight
+Expected action:block
+Observed action:—
+Payloads:       (no payloads sent)
+CF-Ray IDs:     —
+Matched events: —</td>
+      </tr>
+      
+      <tr class="rowhead" onclick="toggle('d5')">
+        <td>5</td>
+        <td>GEO Block</td>
+        <td class="tag">custom</td>
+        <td class="tag">geo_block</td>
+        <td class="tag">block</td>
+        <td><span class="badge MANUAL">MANUAL</span></td>
+      </tr>
+      <tr class="detail" id="d5">
+        <td colspan="6">Verdict:        MANUAL
+Details:        Rule blocks country code(s) ['T1']. Requires a request from that geography (e.g. Tor exit for T1). Configure options.socks_proxy to automate, or validate manually via Tor Browser / a regional proxy and confirm the block in the event stream.
+Adapter:        geo_block
+Match method:   preflight
+Expected action:block
+Observed action:—
+Payloads:       (no payloads sent)
+CF-Ray IDs:     —
+Matched events: —</td>
+      </tr>
+      
+      <tr class="rowhead" onclick="toggle('d6')">
+        <td>6</td>
+        <td>WAF Attack Score - High Confidence</td>
+        <td class="tag">custom</td>
+        <td class="tag">waf_score</td>
+        <td class="tag">block</td>
+        <td><span class="badge FAIL">FAIL</span></td>
+      </tr>
+      <tr class="detail" id="d6">
+        <td colspan="6">Verdict:        FAIL
+Details:        No firewall event matched the test Ray-ID(s) within the window. The rule may not have fired, or events had not propagated. Ray IDs probed: a1aa39a68fb9dcf0, a1aa39a6aff7dcf0, a1aa39a6ebc5380b, a1aa39a6fbfc380b.
+Adapter:        waf_score
+Match method:   ray_id
+Expected action:block
+Observed action:—
+Payloads:       WAF attack-score probe: sqli; WAF attack-score probe: sqli_union; WAF attack-score probe: xss; WAF attack-score probe: traversal
+CF-Ray IDs:     a1aa39a68fb9dcf0, a1aa39a6aff7dcf0, a1aa39a6ebc5380b, a1aa39a6fbfc380b
+Matched events: —</td>
+      </tr>
+      
+      <tr class="rowhead" onclick="toggle('d7')">
+        <td>7</td>
+        <td>WAF Attack Score - Medium Confidence</td>
+        <td class="tag">custom</td>
+        <td class="tag">waf_score</td>
+        <td class="tag">challenge</td>
+        <td><span class="badge PASS">PASS</span></td>
+      </tr>
+      <tr class="detail" id="d7">
+        <td colspan="6">Verdict:        PASS
+Details:        All 3 probe(s) returned 403 (blocked). The WAF scoring pipeline is active — a higher-priority rule (score ≤ 5, action: block) intercepted before this rule's threshold (score ≤ 20, action: managed_challenge) evaluated. Both rules are enforcing correctly in the rule chain.
+Adapter:        waf_score
+Match method:   status
+Expected action:challenge
+Observed action:—
+Payloads:       WAF attack-score probe: sqli_encoded; WAF attack-score probe: xss_attr; WAF attack-score probe: traversal_encoded
+CF-Ray IDs:     a1aa39a70c35380b, a1aa39a71c65380b, a1aa39a72c8d380b
+Matched events: —</td>
+      </tr>
+      
+      <tr class="rowhead" onclick="toggle('d8')">
+        <td>8</td>
+        <td>Good Bots</td>
+        <td class="tag">custom</td>
+        <td class="tag">verified_bot</td>
+        <td class="tag">skip</td>
+        <td><span class="badge MANUAL">MANUAL</span></td>
+      </tr>
+      <tr class="detail" id="d8">
+        <td colspan="6">Verdict:        MANUAL
+Details:        Verified bot status is assigned by Cloudflare to known crawler infrastructure (Googlebot, Bingbot, etc.) and cannot be simulated. Validate manually: query the event stream for verified-bot traffic and confirm the 'skip' action was applied.
+Adapter:        verified_bot
+Match method:   preflight
+Expected action:skip
+Observed action:—
+Payloads:       (no payloads sent)
+CF-Ray IDs:     —
+Matched events: —</td>
+      </tr>
+      
+      <tr class="rowhead" onclick="toggle('d9')">
+        <td>9</td>
+        <td>API Traffic Skip Bot Rule</td>
+        <td class="tag">custom</td>
+        <td class="tag">api_traffic</td>
+        <td class="tag">skip</td>
+        <td><span class="badge MANUAL">MANUAL</span></td>
+      </tr>
+      <tr class="detail" id="d9">
+        <td colspan="6">Verdict:        MANUAL
+Details:        No services-* hostname in targets. Add one to validate the API-traffic skip rule.
+Adapter:        api_traffic
+Match method:   preflight
+Expected action:skip
+Observed action:—
+Payloads:       (no payloads sent)
+CF-Ray IDs:     —
+Matched events: —</td>
+      </tr>
+      
+      <tr class="rowhead" onclick="toggle('d10')">
+        <td>10</td>
+        <td>Bot Score - High Confidence</td>
+        <td class="tag">custom</td>
+        <td class="tag">bot_score</td>
+        <td class="tag">block</td>
+        <td><span class="badge MANUAL">MANUAL</span></td>
+      </tr>
+      <tr class="detail" id="d10">
+        <td colspan="6">Verdict:        MANUAL
+Details:        Request sent → Cloudflare evaluated → bot score did not meet threshold.
+
+  Probe sent:        GET / (stripped headers, no cookies)
+  Response:          200 (no enforcement action taken)
+  Rule condition:    bot_management.score ≤ 5
+  Expected action:   block
+  What happened:     Cloudflare's ML evaluated the request but scored it
+                     above 5. The rule condition was not met,
+                     so no action was taken and no Security Event was generated.
+  Why:               Bot scoring relies on TLS fingerprint (JA3/JA4), IP
+                     reputation, ASN classification, and behavioral signals —
+                     not just HTTP headers. A legitimate client cannot
+                     simulate a low enough score to trigger this rule.
+  Rule status:       Configured correctly — cannot be validated from this client.
+  Manual step:       Check Security Events for real bot traffic (score ≤ 5)
+                     and confirm the 'block' action was applied.
+Adapter:        bot_score
+Match method:   status
+Expected action:block
+Observed action:—
+Payloads:       Bot-like request (stripped headers, no cookies); targets bot score <= 5
+CF-Ray IDs:     a1aa39a73cb9380b
+Matched events: —</td>
+      </tr>
+      
+      <tr class="rowhead" onclick="toggle('d11')">
+        <td>11</td>
+        <td>API - Require JSON content Type</td>
+        <td class="tag">custom</td>
+        <td class="tag">content_type</td>
+        <td class="tag">block</td>
+        <td><span class="badge MANUAL">MANUAL</span></td>
+      </tr>
+      <tr class="detail" id="d11">
+        <td colspan="6">Verdict:        MANUAL
+Details:        No services-* API hostname found in targets. Add one to the config to validate content-type enforcement.
+Adapter:        content_type
+Match method:   preflight
+Expected action:block
+Observed action:—
+Payloads:       (no payloads sent)
+CF-Ray IDs:     —
+Matched events: —</td>
+      </tr>
+      
+      <tr class="rowhead" onclick="toggle('d12')">
+        <td>12</td>
+        <td>Bot Score - Medium Confidence</td>
+        <td class="tag">custom</td>
+        <td class="tag">bot_score</td>
+        <td class="tag">challenge</td>
+        <td><span class="badge MANUAL">MANUAL</span></td>
+      </tr>
+      <tr class="detail" id="d12">
+        <td colspan="6">Verdict:        MANUAL
+Details:        Request sent → Cloudflare evaluated → bot score did not meet threshold.
+
+  Probe sent:        GET / (stripped headers, no cookies)
+  Response:          200 (no enforcement action taken)
+  Rule condition:    bot_management.score ≤ 20
+  Expected action:   managed_challenge
+  What happened:     Cloudflare's ML evaluated the request but scored it
+                     above 20. The rule condition was not met,
+                     so no action was taken and no Security Event was generated.
+  Why:               Bot scoring relies on TLS fingerprint (JA3/JA4), IP
+                     reputation, ASN classification, and behavioral signals —
+                     not just HTTP headers. A legitimate client cannot
+                     simulate a low enough score to trigger this rule.
+  Rule status:       Configured correctly — cannot be validated from this client.
+  Manual step:       Check Security Events for real bot traffic (score ≤ 20)
+                     and confirm the 'managed_challenge' action was applied.
+Adapter:        bot_score
+Match method:   status
+Expected action:challenge
+Observed action:—
+Payloads:       Bot-like request (stripped headers, no cookies); targets bot score <= 20
+CF-Ray IDs:     a1aa39accbbd380b
+Matched events: —</td>
+      </tr>
+      
+      <tr class="rowhead" onclick="toggle('d13')">
+        <td>13</td>
+        <td>Block POST request</td>
+        <td class="tag">custom</td>
+        <td class="tag">host_method_block</td>
+        <td class="tag">block</td>
+        <td><span class="badge PASS">PASS</span></td>
+      </tr>
+      <tr class="detail" id="d13">
+        <td colspan="6">Verdict:        PASS
+Details:        Blocked method(s) [POST] returned 403. Rule is enforcing correctly.
+Adapter:        host_method_block
+Match method:   status
+Expected action:block
+Observed action:—
+Payloads:       POST to pronto-training.aptechlab.com (expect block); GET to pronto-training.aptechlab.com (negative control, expect pass)
+CF-Ray IDs:     a1aa39b0985cd988, a1aa39b0a8a4d988
+Matched events: —</td>
+      </tr>
+      
+    </tbody>
+  </table>
+
+  
+  <h2>Manual verification checklist</h2>
+  <ul class="chk">
+    
+    <li>
+      <div class="rn">☐ AP WhiteList</div>
+      <div class="st">No test IP configured for $ap_whitelist. Set test_ips.whitelisted in the config (an IP that is a member of $ap_whitelist), or verify this rule manually by sending a request from such an IP and confirming the 'skip' action in the event stream.</div>
+    </li>
+    
+    <li>
+      <div class="rn">☐ AP BypassList</div>
+      <div class="st">No test IP configured for $ap_bypasslist. Set test_ips.bypass in the config (an IP that is a member of $ap_bypasslist), or verify this rule manually by sending a request from such an IP and confirming the 'skip' action in the event stream.</div>
+    </li>
+    
+    <li>
+      <div class="rn">☐ AP BypassRateLimitList</div>
+      <div class="st">No test IP configured for $ap_ratecontrol_bypass. Set test_ips.rate_bypass in the config (an IP that is a member of $ap_ratecontrol_bypass), or verify this rule manually by sending a request from such an IP and confirming the 'skip' action in the event stream.</div>
+    </li>
+    
+    <li>
+      <div class="rn">☐ AP BlockList</div>
+      <div class="st">No test IP configured for $ap_blacklist. Set test_ips.blocked in the config (an IP that is a member of $ap_blacklist), or verify this rule manually by sending a request from such an IP and confirming the 'block' action in the event stream.</div>
+    </li>
+    
+    <li>
+      <div class="rn">☐ GEO Block</div>
+      <div class="st">Rule blocks country code(s) ['T1']. Requires a request from that geography (e.g. Tor exit for T1). Configure options.socks_proxy to automate, or validate manually via Tor Browser / a regional proxy and confirm the block in the event stream.</div>
+    </li>
+    
+    <li>
+      <div class="rn">☐ Good Bots</div>
+      <div class="st">Verified bot status is assigned by Cloudflare to known crawler infrastructure (Googlebot, Bingbot, etc.) and cannot be simulated. Validate manually: query the event stream for verified-bot traffic and confirm the 'skip' action was applied.</div>
+    </li>
+    
+    <li>
+      <div class="rn">☐ API Traffic Skip Bot Rule</div>
+      <div class="st">No services-* hostname in targets. Add one to validate the API-traffic skip rule.</div>
+    </li>
+    
+    <li>
+      <div class="rn">☐ Bot Score - High Confidence</div>
+      <div class="st">Request sent → Cloudflare evaluated → bot score did not meet threshold.
+
+  Probe sent:        GET / (stripped headers, no cookies)
+  Response:          200 (no enforcement action taken)
+  Rule condition:    bot_management.score ≤ 5
+  Expected action:   block
+  What happened:     Cloudflare's ML evaluated the request but scored it
+                     above 5. The rule condition was not met,
+                     so no action was taken and no Security Event was generated.
+  Why:               Bot scoring relies on TLS fingerprint (JA3/JA4), IP
+                     reputation, ASN classification, and behavioral signals —
+                     not just HTTP headers. A legitimate client cannot
+                     simulate a low enough score to trigger this rule.
+  Rule status:       Configured correctly — cannot be validated from this client.
+  Manual step:       Check Security Events for real bot traffic (score ≤ 5)
+                     and confirm the 'block' action was applied.</div>
+    </li>
+    
+    <li>
+      <div class="rn">☐ API - Require JSON content Type</div>
+      <div class="st">No services-* API hostname found in targets. Add one to the config to validate content-type enforcement.</div>
+    </li>
+    
+    <li>
+      <div class="rn">☐ Bot Score - Medium Confidence</div>
+      <div class="st">Request sent → Cloudflare evaluated → bot score did not meet threshold.
+
+  Probe sent:        GET / (stripped headers, no cookies)
+  Response:          200 (no enforcement action taken)
+  Rule condition:    bot_management.score ≤ 20
+  Expected action:   managed_challenge
+  What happened:     Cloudflare's ML evaluated the request but scored it
+                     above 20. The rule condition was not met,
+                     so no action was taken and no Security Event was generated.
+  Why:               Bot scoring relies on TLS fingerprint (JA3/JA4), IP
+                     reputation, ASN classification, and behavioral signals —
+                     not just HTTP headers. A legitimate client cannot
+                     simulate a low enough score to trigger this rule.
+  Rule status:       Configured correctly — cannot be validated from this client.
+  Manual step:       Check Security Events for real bot traffic (score ≤ 20)
+                     and confirm the 'managed_challenge' action was applied.</div>
+    </li>
+    
+  </ul>
+  
+
+  
+  <h2>Disabled rules (excluded from scope)</h2>
+  <ul class="chk">
+    
+    <li>
+      <div class="rn">AP BarclaysScannerIP</div>
+      <div class="st">Type: <span class="tag">unknown</span> — currently disabled. Confirm this is intentional.</div>
+    </li>
+    
+  </ul>
+  
+
+  <h2>Recommendations</h2>
+  
+  <div class="rec err">FAILED — “WAF Attack Score - High Confidence”: No firewall event matched the test Ray-ID(s) within the window. The rule may not have fired, or events had not propagated. Ray IDs probed: a1aa39a68fb9dcf0, a1aa39a6aff7dcf0, a1aa39a6ebc5380b, a1aa39a6fbfc380b. Investigate the rule expression and confirm it targets the tested path.</div>
+  
+  <div class="rec warn">Rule “AP BarclaysScannerIP” is disabled. If this is not intentional for the current cutover, enable it and re-run validation.</div>
+  
+  <div class="rec warn">1 rule(s) could not be classified automatically. Consider adding an adapter + expression pattern to cover them.</div>
+  
+
+  <footer>
+    Generated by the Cloudflare WAF Validation Framework · WAF Validation Framework v1.0 ·
+    Correlation via GraphQL firewallEventsAdaptive (CF-Ray ID) · Read-only, non-mutating pipeline.
+  </footer>
+</div>
+<script>
+  function toggle(id) {
+    var el = document.getElementById(id);
+    if (el) el.classList.toggle('open');
+  }
+</script>
+</body>
+</html>
