@@ -5,3 +5,7 @@ zones/*.yaml
 # RunNotes
 notes.txt
 notes.md
+
+# Essentials
+.claude/*
+CLAUDE.md
