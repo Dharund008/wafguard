@@ -6,6 +6,11 @@ zones/*.yaml
 notes.txt
 notes.md
 
-# Essentials
+# Local AI assistant files
 .claude/
 CLAUDE.md
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
