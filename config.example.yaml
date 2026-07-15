@@ -32,9 +32,9 @@ test_ips:
 options:
   request_timeout: 10                    # seconds per request
   rate_limit_buffer: 2                   # extra requests beyond the threshold
-  event_poll_delay: 5                    # seconds to wait before querying events
-  event_poll_retries: 3                  # event-fetch retry attempts
-  event_poll_interval: 5                 # seconds between event-fetch retries
+  event_poll_delay: 30                   # seconds to wait before querying events
+  event_poll_retries: 6                  # event-fetch retry attempts
+  event_poll_interval: 10                # seconds between event-fetch retries
   verify_ssl: true                       # TLS verification for target requests
   user_agent: "AP-WAF-Validator/1.0"
   inter_request_delay: 0.0               # seconds between rate-limit loop requests

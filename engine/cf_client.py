@@ -223,52 +223,92 @@ class CloudflareClient:
     """
 
     def get_firewall_events(
-        self, since_iso: str, until_iso: str, limit: int = 1000
+        self, since_iso: str, until_iso: str, limit: int = 1000,
+        max_pages: int = 5,
     ) -> list[FirewallEvent]:
         """Fetch firewall events in a time window via GraphQL.
+
+        BUG 2 FIX: Paginates automatically when a page returns exactly
+        ``limit`` rows, using the oldest event's datetime as the new
+        ``until`` cursor. Stops after ``max_pages`` to bound runtime.
 
         Correlation by Ray ID is done client-side against ``rayName`` because
         the adaptive dataset does not always expose a rayName filter argument;
         pulling the window and matching locally is robust across API versions.
         """
-        payload = {
-            "query": self._EVENTS_QUERY,
-            "variables": {
-                "zoneTag": self.zone_id,
-                "since": since_iso,
-                "until": until_iso,
-                "limit": limit,
-            },
-        }
-        data = self._request("POST", GRAPHQL_URL, json=payload)
-        log.debug("GraphQL response keys: %s", list(data.keys()) if isinstance(data, dict) else type(data))
-        log.debug("GraphQL errors: %s", data.get("errors"))
+        all_events: list[FirewallEvent] = []
+        current_until = until_iso
+        seen_rays: set[str] = set()
 
-        if data.get("errors"):
-            raise APIError(f"GraphQL errors: {data['errors']}")
+        for page in range(1, max_pages + 1):
+            payload = {
+                "query": self._EVENTS_QUERY,
+                "variables": {
+                    "zoneTag": self.zone_id,
+                    "since": since_iso,
+                    "until": current_until,
+                    "limit": limit,
+                },
+            }
+            data = self._request("POST", GRAPHQL_URL, json=payload)
+            log.debug("GraphQL page %d response keys: %s", page,
+                       list(data.keys()) if isinstance(data, dict) else type(data))
+            log.debug("GraphQL errors: %s", data.get("errors"))
 
-        events: list[FirewallEvent] = []
-        try:
-            zones = data["data"]["viewer"]["zones"]
-        except (KeyError, TypeError):
-            log.debug("GraphQL data structure unexpected: data=%s", str(data)[:500])
-            return events
+            if data.get("errors"):
+                raise APIError(f"GraphQL errors: {data['errors']}")
 
-        log.debug("GraphQL returned %d zone(s), events in first: %d",
-                   len(zones),
-                   len(zones[0].get("firewallEventsAdaptive", []) or []) if zones else 0)
+            page_events: list[FirewallEvent] = []
+            try:
+                zones = data["data"]["viewer"]["zones"]
+            except (KeyError, TypeError):
+                log.debug("GraphQL data structure unexpected: data=%s", str(data)[:500])
+                break
 
-        for zone in zones:
-            for ev in zone.get("firewallEventsAdaptive", []) or []:
-                events.append(
-                    FirewallEvent(
-                        ray_id=(ev.get("rayName") or "").split("-")[0] or None,
-                        action=ev.get("action"),
-                        source=ev.get("source"),
-                        rule_id=ev.get("ruleId"),
-                        description=ev.get("description"),
-                        datetime=ev.get("datetime"),
-                        raw=ev,
+            raw_count = 0
+            for zone in zones:
+                for ev in zone.get("firewallEventsAdaptive", []) or []:
+                    raw_count += 1
+                    ray = (ev.get("rayName") or "").split("-")[0] or None
+                    # Deduplicate across pages (overlap at boundary).
+                    dedup_key = f"{ray}:{ev.get('ruleId')}:{ev.get('action')}"
+                    if dedup_key in seen_rays:
+                        continue
+                    seen_rays.add(dedup_key)
+                    page_events.append(
+                        FirewallEvent(
+                            ray_id=ray,
+                            action=ev.get("action"),
+                            source=ev.get("source"),
+                            rule_id=ev.get("ruleId"),
+                            description=ev.get("description"),
+                            datetime=ev.get("datetime"),
+                            raw=ev,
+                        )
                     )
-                )
-        return events
+
+            log.debug("GraphQL page %d: %d raw, %d new (after dedup)",
+                       page, raw_count, len(page_events))
+            all_events.extend(page_events)
+
+            # If we got fewer than the limit, we have all events.
+            if raw_count < limit:
+                break
+
+            # Paginate: use the oldest event's datetime as the new upper bound.
+            oldest_dt = None
+            for zone in zones:
+                for ev in zone.get("firewallEventsAdaptive", []) or []:
+                    dt = ev.get("datetime")
+                    if dt and (oldest_dt is None or dt < oldest_dt):
+                        oldest_dt = dt
+            if oldest_dt and oldest_dt < current_until:
+                current_until = oldest_dt
+                log.info("Paginating events: page %d fetched %d, cursor → %s",
+                         page, raw_count, current_until)
+            else:
+                break
+
+        log.info("Fetched %d total firewall events across %d page(s).",
+                 len(all_events), min(page, max_pages))
+        return all_events

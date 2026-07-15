@@ -21,9 +21,12 @@ class ConfigError(Exception):
 _DEFAULT_OPTIONS = {
     "request_timeout": 10,
     "rate_limit_buffer": 5,
-    "event_poll_delay": 5,
-    "event_poll_retries": 3,
-    "event_poll_interval": 5,
+    # BUG 3 FIX: CF analytics can take 2-5 min to propagate to GraphQL.
+    # Previous defaults (5s delay, 3 retries, 5s interval = 20s max) caused
+    # frequent false FAILs due to events not yet being queryable.
+    "event_poll_delay": 30,
+    "event_poll_retries": 6,
+    "event_poll_interval": 10,
     "verify_ssl": True,
     "user_agent": "AP-WAF-Validator/1.0",
     "socks_proxy": None,
