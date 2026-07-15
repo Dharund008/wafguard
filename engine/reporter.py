@@ -305,6 +305,8 @@ def render_json(
     def ev_to_dict(e: Evidence) -> dict:
         d = asdict(e)
         d["verdict"] = e.verdict.value
+        # Remove internal fields that shouldn't appear in JSON output.
+        d.pop("_outcomes", None)
         return d
 
     payload = {
