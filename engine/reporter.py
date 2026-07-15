@@ -92,6 +92,7 @@ _TEMPLATE = Template(r"""<!DOCTYPE html>
     <div class="card pass"><div class="n">{{ counts.PASS }}</div><div class="l">Passed</div></div>
     <div class="card fail"><div class="n">{{ counts.FAIL }}</div><div class="l">Failed</div></div>
     <div class="card manual"><div class="n">{{ counts.MANUAL }}</div><div class="l">Manual</div></div>
+    {% if counts.ERROR %}<div class="card fail"><div class="n">{{ counts.ERROR }}</div><div class="l">Errors</div></div>{% endif %}
     <div class="card cov"><div class="n">{{ coverage_pct }}%</div><div class="l">Auto coverage</div></div>
   </section>
 
@@ -99,6 +100,7 @@ _TEMPLATE = Template(r"""<!DOCTYPE html>
     <span style="width: {{ pct.PASS }}%; background: var(--pass);"></span>
     <span style="width: {{ pct.FAIL }}%; background: var(--fail);"></span>
     <span style="width: {{ pct.MANUAL }}%; background: var(--manual);"></span>
+    <span style="width: {{ pct.ERROR }}%; background: var(--fail); opacity: 0.5;"></span>
   </div>
 
   <h2>Coverage breakdown</h2>
@@ -106,7 +108,7 @@ _TEMPLATE = Template(r"""<!DOCTYPE html>
     <div>Rules discovered: <b>{{ cov.total }}</b></div>
     <div>├── Enabled: <b>{{ cov.enabled }}</b></div>
     <div>│&nbsp;&nbsp;&nbsp;├── Auto-testable: <b>{{ cov.auto_testable }}</b></div>
-    <div>│&nbsp;&nbsp;&nbsp;└── Manual / partial: <b>{{ counts.MANUAL }}</b></div>
+    <div>│&nbsp;&nbsp;&nbsp;└── Manual / partial: <b>{{ cov.enabled - cov.auto_testable }}</b></div>
     <div>├── Disabled (excluded): <b>{{ cov.disabled }}</b></div>
     <div>└── Unclassified: <b>{{ cov.unknown }}</b></div>
   </div>
@@ -180,7 +182,7 @@ _TEMPLATE = Template(r"""<!DOCTYPE html>
 FRAMEWORK_VERSION = "WAF Validation Framework v1.0"
 
 
-def _detail_block(e: Evidence) -> str:
+def _detail_block(e: Evidence, outcomes: list | None = None) -> str:
     lines = [
         f"Verdict:        {e.verdict.value}",
         f"Details:        {e.details}",
@@ -192,6 +194,16 @@ def _detail_block(e: Evidence) -> str:
         f"CF-Ray IDs:     {', '.join(e.cf_ray_ids) if e.cf_ray_ids else '—'}",
         f"Matched events: {', '.join(e.matched_event_ids) if e.matched_event_ids else '—'}",
     ]
+    # BUG 8 FIX: Show per-payload status breakdown for multi-payload adapters
+    # so partial enforcement is visible (e.g. 6/8 probes blocked, 2 missed).
+    if outcomes and len(outcomes) > 1:
+        lines.append("")
+        lines.append("Per-payload breakdown:")
+        for i, o in enumerate(outcomes, 1):
+            ray = o.cf_ray_id or "—"
+            status = o.status_code or "err"
+            desc = o.payload.description[:60]
+            lines.append(f"  [{i}] {status:>4}  {ray:<20}  {desc}")
     return "\n".join(lines)
 
 
@@ -244,12 +256,23 @@ def render_html(
         "PASS": round(counts.get("PASS", 0) / executed * 100),
         "FAIL": round(counts.get("FAIL", 0) / executed * 100),
         "MANUAL": round(counts.get("MANUAL", 0) / executed * 100),
+        "ERROR": round(counts.get("ERROR", 0) / executed * 100),
     }
-    auto = counts.get("PASS", 0) + counts.get("FAIL", 0)
-    coverage_pct = round(auto / executed * 100)
+    # BUG 6 FIX: Coverage is auto-tested / auto-testable (from discovery),
+    # NOT (PASS+FAIL) / total_evidence (which includes MANUAL items and
+    # makes coverage look artificially low).
+    auto_tested = counts.get("PASS", 0) + counts.get("FAIL", 0)
+    auto_testable = max(1, coverage.auto_testable) if coverage.auto_testable else max(1, auto_tested)
+    coverage_pct = round(auto_tested / auto_testable * 100)
+
+    # Build a map from rule_id to outcomes for per-payload detail blocks.
+    outcome_map: dict[str, list] = {}
+    if hasattr(evidence, '__iter__'):
+        for e in evidence:
+            outcome_map[e.rule_id] = getattr(e, '_outcomes', None)
 
     for e in evidence:
-        e.detail_block = _detail_block(e)  # type: ignore[attr-defined]
+        e.detail_block = _detail_block(e, outcome_map.get(e.rule_id))  # type: ignore[attr-defined]
 
     manual_items = [e for e in evidence if e.verdict == Verdict.MANUAL]
     recommendations = _build_recommendations(evidence, coverage, disabled_rules)

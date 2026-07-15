@@ -5,12 +5,21 @@ GraphQL and matches each test's CF-Ray IDs to events. The Ray ID is the primary,
 deterministic key. Where an adapter provides its own interpretation (e.g. the
 rate-limit adapter asserting on observed status transitions), that takes
 precedence over generic action-matching.
+
+BUG FIXES applied:
+- BUG 1: Ray ID map now stores lists (multiple events per ray).
+- BUG 3: Event window widened to ±5 min, default poll delay raised to 30s,
+         retries raised to 6 with 10s interval (max ~90s wait).
+- BUG 4: Action alias map expanded (managed_block, js_challenge, etc.).
+- BUG 9: Adapter-interpreted verdicts now include status-based observed
+         action even when no events are found.
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import timedelta
 
@@ -38,17 +47,26 @@ class Evidence:
     action_taken: str | None = None
     match_method: str = ""            # 'ray_id' | 'status' | 'fallback' | 'preflight'
     timestamps: list[str] = field(default_factory=list)
+    _outcomes: list = field(default_factory=list)  # RequestOutcome list for per-payload detail
 
 
 # Normalize CF action names to our vocabulary.
+# BUG 4 FIX: expanded alias map to cover all known Cloudflare action strings.
 _ACTION_ALIASES = {
     "managed_challenge": "challenge",
     "jschallenge": "challenge",
+    "js_challenge": "challenge",
     "challenge": "challenge",
     "block": "block",
+    "managed_block": "block",
+    "simulate_block": "block",
+    "force_connection_close": "block",
+    "connection_close": "block",
     "skip": "skip",
     "allow": "skip",
+    "bypass": "skip",
     "log": "log",
+    "rewrite": "rewrite",
 }
 
 
@@ -78,10 +96,14 @@ class Correlator:
         self, results: list[TestResult], window_start, window_end
     ) -> list[Evidence]:
         events = self._fetch_events(window_start, window_end)
-        by_ray: dict[str, FirewallEvent] = {}
+
+        # BUG 1 FIX: Store *all* events per Ray ID, not just the last one.
+        # A single request can trigger multiple rules (custom + managed),
+        # each producing a separate event with the same Ray ID.
+        by_ray: dict[str, list[FirewallEvent]] = defaultdict(list)
         for ev in events:
             if ev.ray_id:
-                by_ray[ev.ray_id] = ev
+                by_ray[ev.ray_id].append(ev)
 
         evidence: list[Evidence] = []
         for result in results:
@@ -91,12 +113,14 @@ class Correlator:
     # ------------------------------------------------------------------ #
     def _fetch_events(self, window_start, window_end) -> list[FirewallEvent]:
         opts = self.config.options
-        delay = int(opts.get("event_poll_delay", 5))
-        retries = int(opts.get("event_poll_retries", 3))
-        interval = int(opts.get("event_poll_interval", 5))
+        # BUG 3 FIX: Raised defaults — CF analytics can take 2-5 min to propagate.
+        delay = int(opts.get("event_poll_delay", 30))
+        retries = int(opts.get("event_poll_retries", 6))
+        interval = int(opts.get("event_poll_interval", 10))
 
-        since = (window_start - timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        until = (window_end + timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # BUG 3 FIX: Widened window from ±60s to ±5 min.
+        since = (window_start - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        until = (window_end + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
         log.debug("Event query window: %s → %s", since, until)
 
         if delay:
@@ -122,7 +146,7 @@ class Correlator:
     def _reconcile_one(
         self,
         result: TestResult,
-        by_ray: dict[str, FirewallEvent],
+        by_ray: dict[str, list[FirewallEvent]],
         all_events: list[FirewallEvent],
     ) -> Evidence:
         rule = result.rule
@@ -138,6 +162,7 @@ class Correlator:
             payload_summary="; ".join(
                 o.payload.description for o in result.outcomes
             ) or "(no payloads sent)",
+            _outcomes=result.outcomes,
         )
 
         # Pre-flight short circuit (MANUAL / ERROR before any request).
@@ -168,29 +193,49 @@ class Correlator:
                 base.match_method = "status"
                 # Still attach any matched events for evidence.
                 self._attach_events(base, rays, by_ray)
+                # BUG 9 FIX: If adapter returned a verdict based on HTTP status
+                # but no events were found, record the observed HTTP status as
+                # the action_taken so the report doesn't show "Observed: —".
+                if not base.action_taken:
+                    statuses = [
+                        o.status_code for o in result.outcomes if o.status_code
+                    ]
+                    if statuses:
+                        base.action_taken = (
+                            f"HTTP {', '.join(str(s) for s in statuses)} "
+                            f"(status-based, events pending)"
+                        )
                 return base
 
-        # Generic Ray-ID correlation.
-        matched = [by_ray[r] for r in rays if r in by_ray]
-        if matched:
-            actions = {_norm_action(ev.action) for ev in matched}
-            base.matched_event_ids = [ev.ray_id for ev in matched if ev.ray_id]
-            base.timestamps = [ev.datetime for ev in matched if ev.datetime]
+        # BUG 1 FIX: Flatten the list-of-lists for matched events.
+        matched_events: list[FirewallEvent] = []
+        for r in rays:
+            matched_events.extend(by_ray.get(r, []))
+
+        if matched_events:
+            actions = {_norm_action(ev.action) for ev in matched_events}
+            base.matched_event_ids = [
+                ev.ray_id for ev in matched_events if ev.ray_id
+            ]
+            base.timestamps = [
+                ev.datetime for ev in matched_events if ev.datetime
+            ]
             base.action_taken = ", ".join(sorted(a for a in actions if a))
             base.match_method = "ray_id"
 
             if base.expected_action in actions:
                 base.verdict = Verdict.PASS
                 base.details = (
-                    f"Ray-ID matched event(s); observed action '{base.action_taken}' "
+                    f"Ray-ID matched {len(matched_events)} event(s); "
+                    f"observed action '{base.action_taken}' "
                     f"matches expected '{base.expected_action}'."
                 )
             else:
                 base.verdict = Verdict.FAIL
                 base.details = (
-                    f"Ray-ID matched event(s), but observed action "
-                    f"'{base.action_taken}' does not match expected "
-                    f"'{base.expected_action}'."
+                    f"Ray-ID matched {len(matched_events)} event(s), "
+                    f"but observed action '{base.action_taken}' does not match "
+                    f"expected '{base.expected_action}'."
                 )
             return base
 
@@ -218,10 +263,20 @@ class Correlator:
         return base
 
     # ------------------------------------------------------------------ #
-    def _attach_events(self, evidence: Evidence, rays, by_ray) -> None:
-        matched = [by_ray[r] for r in rays if r in by_ray]
+    # BUG 1 FIX: _attach_events now handles list-valued ray map.
+    def _attach_events(
+        self, evidence: Evidence, rays: list[str],
+        by_ray: dict[str, list[FirewallEvent]],
+    ) -> None:
+        matched: list[FirewallEvent] = []
+        for r in rays:
+            matched.extend(by_ray.get(r, []))
         if matched:
-            evidence.matched_event_ids = [ev.ray_id for ev in matched if ev.ray_id]
-            evidence.timestamps = [ev.datetime for ev in matched if ev.datetime]
+            evidence.matched_event_ids = [
+                ev.ray_id for ev in matched if ev.ray_id
+            ]
+            evidence.timestamps = [
+                ev.datetime for ev in matched if ev.datetime
+            ]
             actions = {_norm_action(ev.action) for ev in matched}
             evidence.action_taken = ", ".join(sorted(a for a in actions if a))

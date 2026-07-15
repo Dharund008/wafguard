@@ -81,11 +81,21 @@ class WAFScoreAdapter(BaseTestAdapter):
 
         statuses = [o.status_code for o in result.outcomes if o.status_code]
         if statuses and all(s in (403, 503) for s in statuses):
-            return Verdict.PASS, (
-                f"All {len(statuses)} probe(s) returned 403 (blocked). The WAF "
-                f"scoring pipeline is active — a higher-priority rule (score ≤ 5, "
-                f"action: block) intercepted before this rule's threshold "
-                f"(score ≤ {threshold}, action: {result.expected_action}) evaluated. "
-                f"Both rules are enforcing correctly in the rule chain."
+            # BUG 5 FIX: When a higher-priority rule (score ≤ 5) intercepts
+            # the probes before this rule's threshold is reached, we cannot
+            # confirm THIS rule is working — only that the pipeline is active.
+            # Changed from PASS to MANUAL so the report doesn't claim the
+            # medium-confidence rule is verified when it was never exercised.
+            return Verdict.MANUAL, (
+                f"All {len(statuses)} probe(s) returned 403 (blocked), but a "
+                f"higher-priority rule (score ≤ 5, action: block) intercepted "
+                f"before this rule's threshold (score ≤ {threshold}, action: "
+                f"{result.expected_action}) was reached. The WAF scoring pipeline "
+                f"is active, but this specific rule could not be independently "
+                f"verified.\n\n"
+                f"Manual step: In Security Events, filter for requests with "
+                f"waf.score between 6 and {threshold} and confirm the "
+                f"'{result.expected_action}' action was applied by this rule "
+                f"(not the high-confidence rule)."
             )
         return None, ""
