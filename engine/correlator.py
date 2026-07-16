@@ -13,6 +13,13 @@ BUG FIXES applied:
 - BUG 4: Action alias map expanded (managed_block, js_challenge, etc.).
 - BUG 9: Adapter-interpreted verdicts now include status-based observed
          action even when no events are found.
+- BUG 10: Targeted Ray-ID retry. The poll loop previously broke out as soon
+          as it fetched *any* events for the window — on a live zone with
+          background traffic, the first poll almost always returns
+          something, so the loop exited before the actual test Ray IDs had
+          propagated. It now tracks the specific Ray IDs produced by this
+          run's test payloads and keeps polling (up to event_poll_retries)
+          until all of them are accounted for, or retries are exhausted.
 """
 
 from __future__ import annotations
@@ -52,19 +59,31 @@ class Evidence:
 
 # Normalize CF action names to our vocabulary.
 # BUG 4 FIX: expanded alias map to cover all known Cloudflare action strings.
+# NOTE: GraphQL uses snake_case ("managed_challenge"), Instant Logs uses
+# camelCase ("managedChallenge"). Both forms must be mapped.
 _ACTION_ALIASES = {
-    "managed_challenge": "challenge",
-    "jschallenge": "challenge",
-    "js_challenge": "challenge",
+    # --- challenge variants ---
+    "managed_challenge": "challenge",      # GraphQL
+    "managedChallenge": "challenge",       # Instant Logs
+    "jschallenge": "challenge",            # GraphQL (legacy)
+    "js_challenge": "challenge",           # GraphQL
+    "jsChallenge": "challenge",            # Instant Logs
     "challenge": "challenge",
+    # --- block variants ---
     "block": "block",
-    "managed_block": "block",
-    "simulate_block": "block",
-    "force_connection_close": "block",
-    "connection_close": "block",
+    "managed_block": "block",              # GraphQL
+    "managedBlock": "block",               # Instant Logs
+    "simulate_block": "block",             # GraphQL
+    "simulateBlock": "block",              # Instant Logs
+    "force_connection_close": "block",     # GraphQL
+    "forceConnectionClose": "block",       # Instant Logs
+    "connection_close": "block",           # GraphQL
+    "connectionClose": "block",            # Instant Logs
+    # --- skip / allow variants ---
     "skip": "skip",
     "allow": "skip",
     "bypass": "skip",
+    # --- other ---
     "log": "log",
     "rewrite": "rewrite",
 }
@@ -93,9 +112,33 @@ class Correlator:
 
     # ------------------------------------------------------------------ #
     def reconcile(
-        self, results: list[TestResult], window_start, window_end
+        self,
+        results: list[TestResult],
+        window_start,
+        window_end,
+        *,
+        preloaded_events: list[FirewallEvent] | None = None,
     ) -> list[Evidence]:
-        events = self._fetch_events(window_start, window_end)
+        """Match test results to firewall events.
+
+        Args:
+            preloaded_events: If provided (from Instant Logs WebSocket),
+                these are used directly — no GraphQL fetch, no polling,
+                no propagation delay. If None, falls back to the GraphQL
+                ``firewallEventsAdaptive`` path with retry/polling.
+        """
+        if preloaded_events is not None:
+            log.info(
+                "Using %d pre-collected events (Instant Logs).",
+                len(preloaded_events),
+            )
+            events = preloaded_events
+        else:
+            log.info("No Instant Logs events; falling back to GraphQL polling.")
+            # BUG 10 FIX: collect the exact Ray IDs this run needs to see
+            # before fetching, so the poll loop can target them.
+            expected_rays = self._collect_expected_rays(results)
+            events = self._fetch_events_graphql(window_start, window_end, expected_rays)
 
         # BUG 1 FIX: Store *all* events per Ray ID, not just the last one.
         # A single request can trigger multiple rules (custom + managed),
@@ -111,7 +154,41 @@ class Correlator:
         return evidence
 
     # ------------------------------------------------------------------ #
-    def _fetch_events(self, window_start, window_end) -> list[FirewallEvent]:
+    # BUG 10 FIX: shared helper so reconcile() and _reconcile_one() extract
+    # Ray IDs the same way (preflight-only results contribute nothing, since
+    # they never sent a request).
+    @staticmethod
+    def _rays_for_result(result: TestResult) -> list[str]:
+        rays: list[str] = []
+        if result.preflight_verdict is not None:
+            return rays
+        for o in result.outcomes:
+            for r in o.payload.metadata.get("rays", []):
+                rays.append(_strip_ray_suffix(r))
+            if o.cf_ray_id:
+                rays.append(_strip_ray_suffix(o.cf_ray_id))
+        return rays
+
+    def _collect_expected_rays(self, results: list[TestResult]) -> set[str]:
+        """Ray IDs we actually need to see propagate for this run.
+
+        Rules whose expected action is 'skip' are excluded from the
+        "must appear" set — a skip rule legitimately produces no firewall
+        event, so waiting on it would just burn through every retry.
+        """
+        rays: set[str] = set()
+        for result in results:
+            if _norm_action(result.expected_action) == "skip":
+                continue
+            rays.update(self._rays_for_result(result))
+        return rays
+
+    # ------------------------------------------------------------------ #
+    # GraphQL fallback: polls firewallEventsAdaptive with extended window.
+    # ------------------------------------------------------------------ #
+    def _fetch_events_graphql(
+        self, window_start, window_end, expected_rays: set[str] | None = None,
+    ) -> list[FirewallEvent]:
         opts = self.config.options
         # BUG 3 FIX: Raised defaults — CF analytics can take 2-5 min to propagate.
         delay = int(opts.get("event_poll_delay", 30))
@@ -123,22 +200,62 @@ class Correlator:
         until = (window_end + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
         log.debug("Event query window: %s → %s", since, until)
 
+        expected_rays = expected_rays or set()
+
         if delay:
             log.info("Waiting %ss for events to propagate…", delay)
             time.sleep(delay)
 
         events: list[FirewallEvent] = []
+        seen_rays: set[str] = set()
+
         for attempt in range(1, retries + 1):
             try:
-                events = self.client.get_firewall_events(since, until)
+                fetched = self.client.get_firewall_events(since, until)
             except Exception as exc:
                 log.warning("Event fetch attempt %s failed: %s", attempt, exc)
-                events = []
-            if events:
+                fetched = None
+
+            if fetched is not None:
+                events = fetched
+                seen_rays = {ev.ray_id for ev in events if ev.ray_id}
+
+            if expected_rays:
+                # BUG 10 FIX: success = every expected Ray ID has shown up in
+                # the fetched window, not just "we got a non-empty page".
+                missing = expected_rays - seen_rays
+                if not missing:
+                    log.info(
+                        "All %s expected Ray ID(s) matched after attempt %s/%s.",
+                        len(expected_rays), attempt, retries,
+                    )
+                    break
+                log.info(
+                    "Attempt %s/%s: %s/%s expected Ray ID(s) matched so far, "
+                    "%s still missing.",
+                    attempt, retries,
+                    len(expected_rays) - len(missing), len(expected_rays),
+                    len(missing),
+                )
+            elif events:
+                # No specific Ray IDs to target for this batch (e.g. only
+                # preflight/skip rules ran) — fall back to old behaviour.
                 break
+
             if attempt < retries:
-                log.info("No events yet; retrying in %ss (%s/%s)", interval, attempt, retries)
+                log.info("Retrying in %ss (%s/%s)…", interval, attempt, retries)
                 time.sleep(interval)
+
+        if expected_rays:
+            still_missing = expected_rays - seen_rays
+            if still_missing:
+                log.warning(
+                    "Gave up after %s attempt(s); %s of %s expected Ray ID(s) "
+                    "never appeared in the event stream: %s",
+                    retries, len(still_missing), len(expected_rays),
+                    ", ".join(sorted(still_missing)),
+                )
+
         log.info("Fetched %s firewall events for the window.", len(events))
         return events
 
@@ -174,13 +291,7 @@ class Correlator:
 
         # Collect all Ray IDs seen across this rule's requests.
         # Strip datacenter suffix (e.g. "-MAA") to match GraphQL rayName format.
-        rays: list[str] = []
-        for o in result.outcomes:
-            for r in o.payload.metadata.get("rays", []):
-                rays.append(_strip_ray_suffix(r))
-            if o.cf_ray_id:
-                rays.append(_strip_ray_suffix(o.cf_ray_id))
-        rays = list(dict.fromkeys(rays))  # dedupe, preserve order
+        rays = list(dict.fromkeys(self._rays_for_result(result)))  # dedupe, preserve order
         base.cf_ray_ids = rays
 
         # Adapter-specific interpretation (e.g. rate-limit status assertion).

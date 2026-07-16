@@ -155,14 +155,58 @@ def main(argv=None) -> int:
         return 0
 
     # ---- Stage 4: execution ---------------------------------------- #
+    # Open an Instant Logs WebSocket session BEFORE firing payloads.
+    # Events stream in real-time — zero propagation delay.
+    # If Instant Logs is unavailable, we fall back to GraphQL after execution.
+    instant_logs_events = None
+    il_session = None
+
+    try:
+        from engine.instant_logs import InstantLogsSession
+        il_session = InstantLogsSession(client=client, zone_id=cfg.zone_id)
+        il_active = il_session.start()
+    except ImportError:
+        log.info("websockets library not installed; using GraphQL fallback.")
+        il_active = False
+    except Exception as exc:
+        log.warning("Instant Logs setup failed (%s); using GraphQL fallback.", exc)
+        il_active = False
+
+    if il_active:
+        log.info("Instant Logs active — events will be captured in real-time.")
+    else:
+        log.info("Using GraphQL Analytics for event correlation (may be slower).")
+
     log.info("Executing tests (live)…")
     engine = TestEngine(cfg)
     results = engine.run(rules_scoped)
 
+    # Close the Instant Logs session and collect events.
+    if il_active and il_session is not None:
+        try:
+            from engine.instant_logs import InstantLogsSession
+            raw_events = il_session.stop(drain_seconds=3.0)
+            # Expand multi-match log lines into individual FirewallEvent objects.
+            instant_logs_events = InstantLogsSession.expand_events(
+                il_session._raw_messages
+            )
+            log.info(
+                "Instant Logs: %d raw messages → %d expanded events.",
+                len(il_session._raw_messages), len(instant_logs_events),
+            )
+        except Exception as exc:
+            log.warning("Instant Logs drain failed (%s); falling back to GraphQL.", exc)
+            instant_logs_events = None
+
     # ---- Stage 5: reconciliation ----------------------------------- #
     log.info("Reconciling results against firewall events…")
     correlator = Correlator(client, cfg)
-    evidence = correlator.reconcile(results, engine.window_start, engine.window_end)
+    evidence = correlator.reconcile(
+        results,
+        engine.window_start,
+        engine.window_end,
+        preloaded_events=instant_logs_events,
+    )
 
     # ---- Stage 6: report ------------------------------------------- #
     disabled_rules = [r for r in rules_scoped if not r.enabled]
