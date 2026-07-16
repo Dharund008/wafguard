@@ -16,6 +16,9 @@ dependencies = [
     "Jinja2>=3.1.0",
 ]
 
+[project.optional-dependencies]
+instant-logs = ["websockets>=12.0"]
+
 [project.scripts]
 waf-validator = "waf_validator:main"
 
