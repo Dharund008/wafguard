@@ -49,7 +49,9 @@ A scoped API token with **read-only** permissions:
 Six-stage pipeline: bootstrap → discovery → classification → execution →
 reconciliation → report. Test logic lives in pluggable **adapters** under
 `engine/testers/`. Adding a new rule type is two edits: a new adapter module and
-one line in the classifier's pattern registry. See the design document for detail.
+one line in the classifier's pattern registry. See
+[`PROJECT_ANALYSIS.md`](PROJECT_ANALYSIS.md) for architecture, gaps, and
+evolution directions.
 
 ## Output
 
