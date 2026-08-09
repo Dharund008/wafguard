@@ -1,3 +1,4 @@
+LICENSE
 README.md
 pyproject.toml
 waf_validator.py
@@ -12,6 +13,7 @@ engine/cf_client.py
 engine/config.py
 engine/correlator.py
 engine/discovery.py
+engine/instant_logs.py
 engine/reporter.py
 engine/test_engine.py
 engine/testers/__init__.py
@@ -19,7 +21,10 @@ engine/testers/base.py
 engine/testers/bot_score.py
 engine/testers/content_type.py
 engine/testers/geo_block.py
+engine/testers/helpers.py
+engine/testers/host_method.py
 engine/testers/ip_list.py
+engine/testers/log_observe.py
 engine/testers/managed_ruleset.py
 engine/testers/rate_limit.py
 engine/testers/verified_bot.py

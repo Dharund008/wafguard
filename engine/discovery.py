@@ -1,13 +1,13 @@
 """Rule discovery service + expression parser/classifier.
 
-Discovery fetches the rule inventory across the three firewall phases and
-normalizes each rule into a ``DiscoveredRule``. The classifier pattern-matches
-each rule's Cloudflare expression to determine its semantic type, binds it to a
-test adapter (by class name), and extracts parameters (thresholds, periods, IP
-list names, managed ruleset IDs).
+Discovery fetches the rule inventory across zone *and* account firewall
+phases, expands account custom/rate-limit rulesets that are deployed via
+``execute``, and normalizes each rule into a ``DiscoveredRule``.
 
-The pattern registry is priority-ordered: the first matching pattern wins, so
-specific patterns precede generic ones.
+Classification pattern-matches each rule's Cloudflare expression to determine
+its semantic type, binds it to a test adapter, and extracts parameters. It is
+intentionally generic (any ``$list_name``, any host/method expression) so the
+framework works as a cutover standard across projects.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable
 
-from .cf_client import CloudflareClient
+from .cf_client import MANAGED_RULESET_IDS, CloudflareClient
 
 log = logging.getLogger("waf_validator.discovery")
 
@@ -26,12 +26,6 @@ PHASE_LABELS = {
     "http_request_firewall_custom": "custom",
     "http_ratelimit": "ratelimit",
     "http_request_firewall_managed": "managed",
-}
-
-# Known managed ruleset IDs -> friendly type
-MANAGED_RULESET_IDS = {
-    "efb7b8c949ac4650a09736fc376e9aee": "managed_cf_waf",   # Cloudflare Managed
-    "4814384a9e5d4991b9815dcfc25d2f1f": "managed_owasp",     # OWASP Core
 }
 
 
@@ -48,13 +42,15 @@ class DiscoveredRule:
     manual_reason: str | None = None
     adapter_class: str | None = None
     extracted_params: dict = field(default_factory=dict)
+    scope: str = "zone"                # account | zone
+    ruleset_id: str | None = None
+    deploy_expression: str | None = None  # parent execute filter, if any
+    action_parameters: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------- #
 # Expression classifier
 # ---------------------------------------------------------------------- #
-# Each entry: (compiled_regex, rule_type, adapter_class, param_extractor)
-# param_extractor(match, rule_dict) -> dict
 def _extract_score(match, _rule):
     return {"score_threshold": int(match.group("n"))}
 
@@ -65,8 +61,9 @@ def _extract_ratelimit(_match, rule):
         "period": rl.get("period"),
         "requests_per_period": rl.get("requests_per_period"),
         "counting_expression": rl.get("counting_expression"),
+        "characteristics": rl.get("characteristics"),
+        "mitigation_timeout": rl.get("mitigation_timeout"),
     }
-    # Detect method from the expression if present.
     expr = rule.get("expression", "")
     m = re.search(r'http\.request\.method\s+eq\s+"(\w+)"', expr)
     if m:
@@ -80,8 +77,72 @@ def _extract_country(match, _rule):
     return {"countries": countries}
 
 
-def _extract_list_name(match, _rule):
-    return {"list_name": match.group("name")}
+def _extract_list(match, rule):
+    name = match.group("name")
+    negated = bool(match.groupdict().get("neg"))
+    action = (rule.get("action") or "").lower()
+    # Classify role from action + polarity — not from project-specific names.
+    if action in {"block", "managed_challenge", "challenge", "js_challenge"}:
+        role = "blocklist"
+        rule_type = "ip_blocklist"
+    elif action in {"skip", "allow", "bypass"}:
+        role = "allowlist" if not negated else "blocklist"
+        # skip + in $list => allow/bypass list
+        skip_params = rule.get("action_parameters") or {}
+        products = skip_params.get("products") or []
+        phases = skip_params.get("phases") or []
+        if "rateLimit" in str(products) or "http_ratelimit" in str(phases):
+            rule_type = "rate_bypass"
+            role = "rate_bypass"
+        else:
+            rule_type = "ip_bypass" if "bypass" in (rule.get("description") or "").lower() else "ip_whitelist"
+    elif action == "log":
+        role = "observe"
+        rule_type = "ip_blocklist"  # still IP-list shaped; expect log
+    else:
+        role = "unknown"
+        rule_type = "ip_list"
+    return {
+        "list_name": name,
+        "negated": negated,
+        "list_role": role,
+        "_rule_type": rule_type,
+    }
+
+
+def _extract_host_method(match, rule):
+    expr = rule.get("expression", "") or ""
+    host = match.group("host") if "host" in match.groupdict() and match.group("host") else None
+    hosts = []
+    if host:
+        hosts.append(host)
+    hosts += re.findall(r'http\.host\s+contains\s+"([^"]+)"', expr)
+    hosts += re.findall(r'http\.host\s+eq\s+"([^"]+)"', expr)
+    hosts += re.findall(r'http\.host\s+wildcard\s+r?"([^"]+)"', expr)
+    methods = re.findall(r'http\.request\.method\s+(?:eq|in)\s+', expr)
+    method_vals = re.findall(r'"([A-Z]+)"', expr) if "http.request.method" in expr else []
+    # Prefer only method tokens near method clause; fall back to quoted verbs.
+    method_set = [m for m in method_vals if m in {
+        "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS",
+    }]
+    return {
+        "hosts": list(dict.fromkeys(hosts)),
+        "host": hosts[0] if hosts else "",
+        "methods": method_set or ["POST"],
+    }
+
+
+def _host_family_params(match, rule):
+    expr = rule.get("expression", "") or ""
+    contains = re.findall(r'http\.host\s+contains\s+"([^"]+)"', expr)
+    equals = re.findall(r'http\.host\s+eq\s+"([^"]+)"', expr)
+    wildcards = re.findall(r'http\.host\s+wildcard\s+r?"([^"]+)"', expr)
+    return {
+        "hosts": list(dict.fromkeys(contains + equals + wildcards)),
+        "host_contains": contains,
+        "host_equals": equals,
+        "host_wildcards": wildcards,
+    }
 
 
 _PATTERN_REGISTRY: list[tuple[re.Pattern, str, str, Callable]] = [
@@ -91,54 +152,51 @@ _PATTERN_REGISTRY: list[tuple[re.Pattern, str, str, Callable]] = [
     # Bot management score
     (re.compile(r"cf\.bot_management\.score\s+le\s+(?P<n>\d+)"),
      "bot_score", "BotScoreAdapter", _extract_score),
-    # IP lists (specific list names first)
-    (re.compile(r"ip\.src\s+in\s+\$(?P<name>ap_blacklist)"),
-     "ip_blocklist", "IPListAdapter", _extract_list_name),
-    (re.compile(r"ip\.src\s+in\s+\$(?P<name>ap_whitelist)"),
-     "ip_whitelist", "IPListAdapter", _extract_list_name),
-    (re.compile(r"ip\.src\s+in\s+\$(?P<name>ap_bypasslist)"),
-     "ip_bypass", "IPListAdapter", _extract_list_name),
-    (re.compile(r"ip\.src\s+in\s+\$(?P<name>ap_ratecontrol_bypass)"),
-     "rate_bypass", "IPListAdapter", _extract_list_name),
+    # IP lists (any $name) — polarity optional via "not "
+    (re.compile(r"(?P<neg>not\s+)?ip\.src\s+in\s+\$(?P<name>[A-Za-z0-9_]+)"),
+     "ip_list", "IPListAdapter", _extract_list),
     # Geo block
-    (re.compile(r"ip\.src\.country\s+in\s+\{(?P<list>[^}]*)\}"),
+    (re.compile(
+        r"(?:ip\.src\.country|ip\.geoip\.country|ip\.country)\s+in\s+\{(?P<list>[^}]*)\}"
+     ),
      "geo_block", "GeoBlockAdapter", _extract_country),
-    # Content-type enforcement (JSON required on API hosts)
-    (re.compile(r'content-type.*application/json', re.IGNORECASE | re.DOTALL),
-     "content_type", "ContentTypeAdapter", lambda m, r: {}),
-    # Host + method block (e.g. block POST to hosts containing "pronto-training")
-    (re.compile(r'http\.host\s+contains\s+"(?P<host>[^"]+)"'),
-     "host_method_block", "HostMethodAdapter",
-     lambda m, r: {"host": m.group("host"),
-                    "methods": re.findall(r'"(\w+)"', r.get("expression", ""))}),
+    # Content-type enforcement
+    (re.compile(r'content-type|content_type|application/json', re.IGNORECASE),
+     "content_type", "ContentTypeAdapter", _host_family_params),
     # Verified good bots
-    (re.compile(r"cf\.verified_bot_category"),
+    (re.compile(r"cf\.verified_bot_category|cf\.bot_management\.verified_bot"),
      "verified_bot", "VerifiedBotAdapter", lambda m, r: {}),
-    # API traffic skip bot rule
-    (re.compile(r'http\.host\s+wildcard\s+r?"services-\*"'),
-     "api_traffic", "APITrafficAdapter", lambda m, r: {}),
+    # Host + method block (host constraint with method constraint)
+    (re.compile(
+        r'http\.host\s+(?:contains|eq|wildcard)\s+r?"?(?P<host>[^"\s]+)"?'
+        r'[\s\S]*http\.request\.method'
+        r'|http\.request\.method[\s\S]*http\.host\s+(?:contains|eq|wildcard)'
+     ),
+     "host_method_block", "HostMethodAdapter", _extract_host_method),
+    # Host-scoped skip / allow (API traffic style) — host match without score/list
+    (re.compile(r"http\.host\s+(?:contains|eq|wildcard)"),
+     "host_scoped", "APITrafficAdapter", _host_family_params),
 ]
 
 
 def classify(rule: dict) -> tuple[str, str | None, dict]:
-    """Return (rule_type, adapter_class, params) for a raw CF rule dict.
-
-    Managed rulesets are handled by their execute action_parameters ID before
-    the expression registry, since their expression is usually just ``true``.
-    """
+    """Return (rule_type, adapter_class, params) for a raw CF rule dict."""
     action = rule.get("action", "")
     ap = rule.get("action_parameters", {}) or {}
 
-    # Managed ruleset execution
+    # Managed ruleset execution (do not expand individual managed rules).
     if action == "execute":
         rid = ap.get("id")
-        rtype = MANAGED_RULESET_IDS.get(rid, "managed_unknown")
-        return rtype, "ManagedRulesetAdapter", {"managed_id": rid}
+        if rid in MANAGED_RULESET_IDS:
+            rtype = MANAGED_RULESET_IDS[rid]
+            return rtype, "ManagedRulesetAdapter", {"managed_id": rid}
+        # Custom ruleset execute is expanded by DiscoveryService; if we still
+        # see one here, mark it as a deployment wrapper.
+        return "ruleset_deploy", None, {"managed_id": rid}
 
     expr = rule.get("expression", "") or ""
 
-    # Rate limit rules carry a ratelimit block; classify by that, using the
-    # counting_expression to distinguish 404-style rules.
+    # Rate limit rules carry a ratelimit block.
     if "ratelimit" in rule and rule.get("ratelimit"):
         params = _extract_ratelimit(None, rule)
         counting = (params.get("counting_expression") or "")
@@ -146,17 +204,91 @@ def classify(rule: dict) -> tuple[str, str | None, dict]:
             return "rate_limit_404", "RateLimitAdapter", params
         return "rate_limit", "RateLimitAdapter", params
 
+    # Catch-all log of everything — still auto-testable via event evidence.
+    if action == "log" and (
+        expr.strip() in {"true", "(true)"}
+        or re.search(r'http\.host\s+wildcard\s+r?"?\*?"?', expr)
+    ):
+        if "content-type" not in expr.lower() and "ip.src" not in expr:
+            return "log_observe", "LogObserveAdapter", {}
+
     for pattern, rtype, adapter, extractor in _PATTERN_REGISTRY:
         m = pattern.search(expr)
         if m:
             try:
                 params = extractor(m, rule)
-            except Exception as exc:  # defensive: never let extraction crash discovery
+            except Exception as exc:
                 log.warning("Param extraction failed for %s: %s", rtype, exc)
                 params = {}
+            # IP-list extractor may override rule_type.
+            if rtype == "ip_list" and params.get("_rule_type"):
+                rtype = params.pop("_rule_type")
             return rtype, adapter, params
 
     return "unknown", None, {}
+
+
+# ---------------------------------------------------------------------- #
+# Host / deploy-filter helpers
+# ---------------------------------------------------------------------- #
+def hostname_matches_rule(hostname: str, params: dict, expression: str = "") -> bool:
+    """Return True if ``hostname`` is in scope for host-based rule params."""
+    host = hostname.lower()
+    for needle in params.get("host_contains") or []:
+        if needle.lower() in host:
+            return True
+    for needle in params.get("host_equals") or []:
+        if host == needle.lower():
+            return True
+    for needle in params.get("hosts") or []:
+        n = needle.lower().rstrip("*")
+        if n and n in host:
+            return True
+        if needle == "*" or needle == "r\"*\"":
+            return True
+    for pat in params.get("host_wildcards") or []:
+        # Convert simple CF wildcard (e.g. services-*) to regex.
+        rx = "^" + re.escape(pat).replace(r"\*", ".*") + "$"
+        if re.match(rx, host, re.IGNORECASE):
+            return True
+    # Fallback: substring from extracted host field.
+    single = (params.get("host") or "").lower()
+    if single and single in host:
+        return True
+    # Expression-level contains checks when params empty.
+    for needle in re.findall(r'http\.host\s+contains\s+"([^"]+)"', expression or ""):
+        if needle.lower() in host:
+            return True
+    return False
+
+
+def deploy_filter_applies(expression: str | None, zone_plan_legacy: str | None) -> bool:
+    """Best-effort check that an account deploy filter applies to this zone."""
+    if not expression or expression.strip() in {"true", "(true)"}:
+        return True
+    expr = expression.lower()
+    if "cf.zone.plan" in expr and zone_plan_legacy:
+        # e.g. (cf.zone.plan eq "ENT") — Cloudflare uses ENT for enterprise.
+        plan = zone_plan_legacy.lower()
+        aliases = {
+            "enterprise": {"ent", "enterprise"},
+            "business": {"biz", "business"},
+            "pro": {"pro"},
+            "free": {"free"},
+        }
+        wanted = set(re.findall(r'"([^"]+)"', expr))
+        wanted_l = {w.lower() for w in wanted}
+        for legacy, names in aliases.items():
+            if plan == legacy and (wanted_l & names or wanted_l & {legacy}):
+                return True
+        # If filter mentions plan but we couldn't match, still include with caution.
+        if wanted_l:
+            log.debug(
+                "Deploy filter %r vs plan %r — including rule (uncertain match).",
+                expression, zone_plan_legacy,
+            )
+            return True
+    return True
 
 
 # ---------------------------------------------------------------------- #
@@ -168,31 +300,144 @@ class DiscoveryService:
 
     def discover(self) -> list[DiscoveredRule]:
         discovered: list[DiscoveredRule] = []
-        for phase, label in PHASE_LABELS.items():
-            try:
-                entry = self.client.get_entrypoint_ruleset(phase)
-            except Exception as exc:
-                log.warning("Could not fetch entrypoint for phase %s: %s", phase, exc)
-                continue
+        zone_info = None
+        try:
+            zone_info = self.client.get_zone_info()
+        except Exception as exc:
+            log.warning("Zone info lookup failed: %s", exc)
 
-            for rule in entry.get("rules", []) or []:
-                dr = self._normalize(rule, label)
-                discovered.append(dr)
+        plan_legacy = zone_info.plan_legacy_id if zone_info else None
+        account_id = self.client.ensure_account_id()
+
+        for phase, label in PHASE_LABELS.items():
+            # Zone entrypoint
+            discovered.extend(
+                self._discover_entrypoint(phase, label, scope="zone",
+                                          plan_legacy=plan_legacy)
+            )
+            # Account entrypoint (+ expand custom executes)
+            if account_id:
+                discovered.extend(
+                    self._discover_entrypoint(phase, label, scope="account",
+                                              plan_legacy=plan_legacy)
+                )
+            else:
+                log.warning(
+                    "No account_id available; skipping account-level discovery "
+                    "for phase %s.", phase,
+                )
+
+        log.info(
+            "Discovery complete: %d rules (%d account, %d zone).",
+            len(discovered),
+            sum(1 for r in discovered if r.scope == "account"),
+            sum(1 for r in discovered if r.scope == "zone"),
+        )
         return discovered
 
-    def _normalize(self, rule: dict, phase_label: str) -> DiscoveredRule:
+    def _discover_entrypoint(
+        self, phase: str, label: str, *, scope: str, plan_legacy: str | None,
+    ) -> list[DiscoveredRule]:
+        out: list[DiscoveredRule] = []
+        try:
+            entry = self.client.get_entrypoint_ruleset(phase, scope=scope)
+        except Exception as exc:
+            log.warning("Could not fetch %s entrypoint for phase %s: %s",
+                        scope, phase, exc)
+            return out
+
+        if not entry:
+            return out
+
+        entry_id = entry.get("id")
+        for rule in entry.get("rules", []) or []:
+            action = rule.get("action")
+            ap = rule.get("action_parameters") or {}
+            target_id = ap.get("id")
+            deploy_expr = rule.get("expression") or ""
+
+            # Expand custom/rate-limit rulesets deployed via execute.
+            # Do NOT expand managed rulesets (test as a single unit).
+            if (
+                action == "execute"
+                and target_id
+                and target_id not in MANAGED_RULESET_IDS
+                and scope == "account"
+            ):
+                if not deploy_filter_applies(deploy_expr, plan_legacy):
+                    log.info(
+                        "Skipping account ruleset %s — deploy filter %r does not "
+                        "apply to this zone.", target_id, deploy_expr,
+                    )
+                    continue
+                out.extend(
+                    self._expand_ruleset(
+                        target_id, label, scope=scope,
+                        deploy_expression=deploy_expr,
+                    )
+                )
+                continue
+
+            if action == "execute" and target_id in MANAGED_RULESET_IDS:
+                if scope == "account" and not deploy_filter_applies(deploy_expr, plan_legacy):
+                    continue
+
+            dr = self._normalize(
+                rule, label, scope=scope, ruleset_id=entry_id,
+                deploy_expression=deploy_expr if scope == "account" else None,
+            )
+            out.append(dr)
+        return out
+
+    def _expand_ruleset(
+        self, ruleset_id: str, phase_label: str, *, scope: str,
+        deploy_expression: str | None,
+    ) -> list[DiscoveredRule]:
+        out: list[DiscoveredRule] = []
+        try:
+            rs = self.client.get_ruleset(ruleset_id, scope=scope)
+        except Exception as exc:
+            log.warning("Could not expand ruleset %s: %s", ruleset_id, exc)
+            return out
+
+        name = rs.get("name") or ruleset_id
+        log.info("Expanded %s ruleset '%s' (%s) → %d rules.",
+                 scope, name, ruleset_id, len(rs.get("rules") or []))
+        for rule in rs.get("rules") or []:
+            # Nested execute of a managed ruleset inside a custom ruleset.
+            if rule.get("action") == "execute":
+                rid = (rule.get("action_parameters") or {}).get("id")
+                if rid in MANAGED_RULESET_IDS:
+                    out.append(self._normalize(
+                        rule, phase_label, scope=scope, ruleset_id=ruleset_id,
+                        deploy_expression=deploy_expression,
+                    ))
+                    continue
+                # Nested custom — expand one more level.
+                if rid:
+                    out.extend(self._expand_ruleset(
+                        rid, phase_label, scope=scope,
+                        deploy_expression=deploy_expression,
+                    ))
+                    continue
+            out.append(self._normalize(
+                rule, phase_label, scope=scope, ruleset_id=ruleset_id,
+                deploy_expression=deploy_expression,
+            ))
+        return out
+
+    def _normalize(
+        self, rule: dict, phase_label: str, *, scope: str,
+        ruleset_id: str | None, deploy_expression: str | None,
+    ) -> DiscoveredRule:
         rule_type, adapter_class, params = classify(rule)
 
-        from .testers import get_adapter  # local import avoids cycle at import time
+        from .testers import get_adapter
 
         testable = False
         manual_reason = None
         if adapter_class:
             adapter = get_adapter(adapter_class)
-            # We can't run can_execute() without a config here; discovery only
-            # records that an adapter exists. The engine performs the real
-            # pre-flight check with config in hand. We mark unknown types as
-            # not-testable up front.
             testable = adapter is not None
         else:
             manual_reason = "No adapter matches this rule expression."
@@ -209,6 +454,10 @@ class DiscoveryService:
             manual_reason=manual_reason,
             adapter_class=adapter_class,
             extracted_params=params,
+            scope=scope,
+            ruleset_id=ruleset_id,
+            deploy_expression=deploy_expression,
+            action_parameters=rule.get("action_parameters") or {},
         )
 
 
@@ -223,6 +472,8 @@ class CoverageStats:
     auto_testable: int = 0
     manual: int = 0
     unknown: int = 0
+    account: int = 0
+    zone: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -232,6 +483,8 @@ class CoverageStats:
             "auto_testable": self.auto_testable,
             "manual": self.manual,
             "unknown": self.unknown,
+            "account": self.account,
+            "zone": self.zone,
         }
 
 
@@ -239,6 +492,10 @@ def compute_coverage(rules: list[DiscoveredRule]) -> CoverageStats:
     stats = CoverageStats()
     stats.total = len(rules)
     for r in rules:
+        if r.scope == "account":
+            stats.account += 1
+        else:
+            stats.zone += 1
         if r.enabled:
             stats.enabled += 1
         else:
@@ -247,4 +504,6 @@ def compute_coverage(rules: list[DiscoveredRule]) -> CoverageStats:
             stats.unknown += 1
         if r.enabled and r.testable:
             stats.auto_testable += 1
+        elif r.enabled and not r.testable:
+            stats.manual += 1
     return stats

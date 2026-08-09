@@ -1,25 +1,9 @@
 """Event reconciliation service.
 
-After execution, the correlator fetches firewall events for the test window via
-GraphQL and matches each test's CF-Ray IDs to events. The Ray ID is the primary,
-deterministic key. Where an adapter provides its own interpretation (e.g. the
-rate-limit adapter asserting on observed status transitions), that takes
-precedence over generic action-matching.
-
-BUG FIXES applied:
-- BUG 1: Ray ID map now stores lists (multiple events per ray).
-- BUG 3: Event window widened to ±5 min, default poll delay raised to 30s,
-         retries raised to 6 with 10s interval (max ~90s wait).
-- BUG 4: Action alias map expanded (managed_block, js_challenge, etc.).
-- BUG 9: Adapter-interpreted verdicts now include status-based observed
-         action even when no events are found.
-- BUG 10: Targeted Ray-ID retry. The poll loop previously broke out as soon
-          as it fetched *any* events for the window — on a live zone with
-          background traffic, the first poll almost always returns
-          something, so the loop exited before the actual test Ray IDs had
-          propagated. It now tracks the specific Ray IDs produced by this
-          run's test payloads and keeps polling (up to event_poll_retries)
-          until all of them are accounted for, or retries are exhausted.
+Prefers Instant Logs (real-time) when available, falls back to GraphQL
+``firewallEventsAdaptive``, and can hybrid-fill missing Ray IDs from GraphQL
+when Instant Logs was partial. Matches tests to events by CF-Ray ID and, when
+possible, by rule id — proving the classified WAF rule actually fired.
 """
 
 from __future__ import annotations
@@ -52,38 +36,33 @@ class Evidence:
     cf_ray_ids: list[str] = field(default_factory=list)
     matched_event_ids: list[str] = field(default_factory=list)
     action_taken: str | None = None
-    match_method: str = ""            # 'ray_id' | 'status' | 'fallback' | 'preflight'
+    match_method: str = ""            # 'ray_id' | 'rule_id' | 'status' | 'fallback' | 'preflight'
     timestamps: list[str] = field(default_factory=list)
-    _outcomes: list = field(default_factory=list)  # RequestOutcome list for per-payload detail
+    scope: str = "zone"
+    evidence_source: str = ""         # instant_logs | graphql | hybrid | none
+    security_event_verified: bool = False
+    _outcomes: list = field(default_factory=list)
 
 
-# Normalize CF action names to our vocabulary.
-# BUG 4 FIX: expanded alias map to cover all known Cloudflare action strings.
-# NOTE: GraphQL uses snake_case ("managed_challenge"), Instant Logs uses
-# camelCase ("managedChallenge"). Both forms must be mapped.
 _ACTION_ALIASES = {
-    # --- challenge variants ---
-    "managed_challenge": "challenge",      # GraphQL
-    "managedChallenge": "challenge",       # Instant Logs
-    "jschallenge": "challenge",            # GraphQL (legacy)
-    "js_challenge": "challenge",           # GraphQL
-    "jsChallenge": "challenge",            # Instant Logs
+    "managed_challenge": "challenge",
+    "managedChallenge": "challenge",
+    "jschallenge": "challenge",
+    "js_challenge": "challenge",
+    "jsChallenge": "challenge",
     "challenge": "challenge",
-    # --- block variants ---
     "block": "block",
-    "managed_block": "block",              # GraphQL
-    "managedBlock": "block",               # Instant Logs
-    "simulate_block": "block",             # GraphQL
-    "simulateBlock": "block",              # Instant Logs
-    "force_connection_close": "block",     # GraphQL
-    "forceConnectionClose": "block",       # Instant Logs
-    "connection_close": "block",           # GraphQL
-    "connectionClose": "block",            # Instant Logs
-    # --- skip / allow variants ---
+    "managed_block": "block",
+    "managedBlock": "block",
+    "simulate_block": "block",
+    "simulateBlock": "block",
+    "force_connection_close": "block",
+    "forceConnectionClose": "block",
+    "connection_close": "block",
+    "connectionClose": "block",
     "skip": "skip",
     "allow": "skip",
     "bypass": "skip",
-    # --- other ---
     "log": "log",
     "rewrite": "rewrite",
 }
@@ -92,13 +71,10 @@ _ACTION_ALIASES = {
 def _norm_action(action: str | None) -> str:
     if not action:
         return ""
-    return _ACTION_ALIASES.get(action, action)
+    return _ACTION_ALIASES.get(action, action.lower() if action else "")
 
 
 def _strip_ray_suffix(ray: str) -> str:
-    """Strip the datacenter suffix from a CF-Ray ID.
-
-    HTTP header returns 'abc123-MAA', GraphQL returns 'abc123'."""
     parts = ray.rsplit("-", 1)
     if len(parts) == 2 and parts[1].isalpha():
         return parts[0]
@@ -109,8 +85,9 @@ class Correlator:
     def __init__(self, client: CloudflareClient, config: Config):
         self.client = client
         self.config = config
+        self.evidence_source: str = "none"
+        self.evidence_note: str = ""
 
-    # ------------------------------------------------------------------ #
     def reconcile(
         self,
         results: list[TestResult],
@@ -119,30 +96,49 @@ class Correlator:
         *,
         preloaded_events: list[FirewallEvent] | None = None,
     ) -> list[Evidence]:
-        """Match test results to firewall events.
+        expected_rays = self._collect_expected_rays(results)
+        events: list[FirewallEvent] = []
+        source = "none"
 
-        Args:
-            preloaded_events: If provided (from Instant Logs WebSocket),
-                these are used directly — no GraphQL fetch, no polling,
-                no propagation delay. If None, falls back to the GraphQL
-                ``firewallEventsAdaptive`` path with retry/polling.
-        """
         if preloaded_events is not None:
-            log.info(
-                "Using %d pre-collected events (Instant Logs).",
-                len(preloaded_events),
-            )
-            events = preloaded_events
+            events = list(preloaded_events)
+            source = "instant_logs"
+            log.info("Using %d Instant Logs events.", len(events))
+            # Hybrid fill: if Instant Logs missed expected rays, query GraphQL.
+            seen = {ev.ray_id for ev in events if ev.ray_id}
+            missing = expected_rays - seen
+            if missing and self.config.options.get("hybrid_graphql_fill", True):
+                log.info(
+                    "Instant Logs missing %d expected Ray ID(s); hybrid GraphQL fill…",
+                    len(missing),
+                )
+                # Shorter wait: Instant Logs already drained; analytics only needs a brief lag.
+                saved_delay = self.config.options.get("event_poll_delay")
+                self.config.options["event_poll_delay"] = int(
+                    self.config.options.get("hybrid_poll_delay", 15)
+                )
+                try:
+                    gql = self._fetch_events_graphql(window_start, window_end, missing)
+                finally:
+                    if saved_delay is not None:
+                        self.config.options["event_poll_delay"] = saved_delay
+                if gql:
+                    events = self._merge_events(events, gql)
+                    source = "hybrid"
+                    log.info("Hybrid merge complete: %d total events.", len(events))
         else:
             log.info("No Instant Logs events; falling back to GraphQL polling.")
-            # BUG 10 FIX: collect the exact Ray IDs this run needs to see
-            # before fetching, so the poll loop can target them.
-            expected_rays = self._collect_expected_rays(results)
             events = self._fetch_events_graphql(window_start, window_end, expected_rays)
+            source = "graphql" if events is not None else "none"
 
-        # BUG 1 FIX: Store *all* events per Ray ID, not just the last one.
-        # A single request can trigger multiple rules (custom + managed),
-        # each producing a separate event with the same Ray ID.
+        self.evidence_source = source
+        self.evidence_note = {
+            "instant_logs": "Real-time Instant Logs WebSocket.",
+            "graphql": "GraphQL firewallEventsAdaptive (analytics; may be sampled/delayed).",
+            "hybrid": "Instant Logs primary with GraphQL fill for missing Ray IDs.",
+            "none": "No event source available.",
+        }.get(source, source)
+
         by_ray: dict[str, list[FirewallEvent]] = defaultdict(list)
         for ev in events:
             if ev.ray_id:
@@ -150,13 +146,25 @@ class Correlator:
 
         evidence: list[Evidence] = []
         for result in results:
-            evidence.append(self._reconcile_one(result, by_ray, events))
+            ev = self._reconcile_one(result, by_ray, events)
+            ev.evidence_source = source
+            evidence.append(ev)
         return evidence
 
-    # ------------------------------------------------------------------ #
-    # BUG 10 FIX: shared helper so reconcile() and _reconcile_one() extract
-    # Ray IDs the same way (preflight-only results contribute nothing, since
-    # they never sent a request).
+    @staticmethod
+    def _merge_events(
+        primary: list[FirewallEvent], extra: list[FirewallEvent],
+    ) -> list[FirewallEvent]:
+        seen: set[str] = set()
+        out: list[FirewallEvent] = []
+        for ev in primary + extra:
+            key = f"{ev.ray_id}:{ev.rule_id}:{ev.action}"
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(ev)
+        return out
+
     @staticmethod
     def _rays_for_result(result: TestResult) -> list[str]:
         rays: list[str] = []
@@ -170,12 +178,6 @@ class Correlator:
         return rays
 
     def _collect_expected_rays(self, results: list[TestResult]) -> set[str]:
-        """Ray IDs we actually need to see propagate for this run.
-
-        Rules whose expected action is 'skip' are excluded from the
-        "must appear" set — a skip rule legitimately produces no firewall
-        event, so waiting on it would just burn through every retry.
-        """
         rays: set[str] = set()
         for result in results:
             if _norm_action(result.expected_action) == "skip":
@@ -183,19 +185,14 @@ class Correlator:
             rays.update(self._rays_for_result(result))
         return rays
 
-    # ------------------------------------------------------------------ #
-    # GraphQL fallback: polls firewallEventsAdaptive with extended window.
-    # ------------------------------------------------------------------ #
     def _fetch_events_graphql(
         self, window_start, window_end, expected_rays: set[str] | None = None,
     ) -> list[FirewallEvent]:
         opts = self.config.options
-        # BUG 3 FIX: Raised defaults — CF analytics can take 2-5 min to propagate.
         delay = int(opts.get("event_poll_delay", 30))
         retries = int(opts.get("event_poll_retries", 6))
         interval = int(opts.get("event_poll_interval", 10))
 
-        # BUG 3 FIX: Widened window from ±60s to ±5 min.
         since = (window_start - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
         until = (window_end + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
         log.debug("Event query window: %s → %s", since, until)
@@ -208,10 +205,16 @@ class Correlator:
 
         events: list[FirewallEvent] = []
         seen_rays: set[str] = set()
+        # Prefer primary target host filter to avoid drowning rays on busy zones.
+        host = None
+        try:
+            host = self.config.primary_target().hostname
+        except Exception:
+            host = None
 
         for attempt in range(1, retries + 1):
             try:
-                fetched = self.client.get_firewall_events(since, until)
+                fetched = self.client.get_firewall_events(since, until, host=host)
             except Exception as exc:
                 log.warning("Event fetch attempt %s failed: %s", attempt, exc)
                 fetched = None
@@ -221,8 +224,6 @@ class Correlator:
                 seen_rays = {ev.ray_id for ev in events if ev.ray_id}
 
             if expected_rays:
-                # BUG 10 FIX: success = every expected Ray ID has shown up in
-                # the fetched window, not just "we got a non-empty page".
                 missing = expected_rays - seen_rays
                 if not missing:
                     log.info(
@@ -238,8 +239,6 @@ class Correlator:
                     len(missing),
                 )
             elif events:
-                # No specific Ray IDs to target for this batch (e.g. only
-                # preflight/skip rules ran) — fall back to old behaviour.
                 break
 
             if attempt < retries:
@@ -251,15 +250,14 @@ class Correlator:
             if still_missing:
                 log.warning(
                     "Gave up after %s attempt(s); %s of %s expected Ray ID(s) "
-                    "never appeared in the event stream: %s",
+                    "never appeared: %s",
                     retries, len(still_missing), len(expected_rays),
-                    ", ".join(sorted(still_missing)),
+                    ", ".join(sorted(still_missing)[:10]),
                 )
 
         log.info("Fetched %s firewall events for the window.", len(events))
         return events
 
-    # ------------------------------------------------------------------ #
     def _reconcile_one(
         self,
         result: TestResult,
@@ -279,22 +277,19 @@ class Correlator:
             payload_summary="; ".join(
                 o.payload.description for o in result.outcomes
             ) or "(no payloads sent)",
+            scope=getattr(rule, "scope", "zone"),
             _outcomes=result.outcomes,
         )
 
-        # Pre-flight short circuit (MANUAL / ERROR before any request).
         if result.preflight_verdict is not None:
             base.verdict = result.preflight_verdict
             base.details = result.preflight_reason
             base.match_method = "preflight"
             return base
 
-        # Collect all Ray IDs seen across this rule's requests.
-        # Strip datacenter suffix (e.g. "-MAA") to match GraphQL rayName format.
-        rays = list(dict.fromkeys(self._rays_for_result(result)))  # dedupe, preserve order
+        rays = list(dict.fromkeys(self._rays_for_result(result)))
         base.cf_ray_ids = rays
 
-        # Adapter-specific interpretation (e.g. rate-limit status assertion).
         adapter = get_adapter(rule.adapter_class) if rule.adapter_class else None
         if adapter is not None:
             verdict, details = adapter.interpret(result, by_ray)
@@ -302,11 +297,24 @@ class Correlator:
                 base.verdict = verdict
                 base.details = details
                 base.match_method = "status"
-                # Still attach any matched events for evidence.
-                self._attach_events(base, rays, by_ray)
-                # BUG 9 FIX: If adapter returned a verdict based on HTTP status
-                # but no events were found, record the observed HTTP status as
-                # the action_taken so the report doesn't show "Observed: —".
+                # For managed rulesets, any firewallManaged event on our rays
+                # counts as security-event verification (child rule ids differ
+                # from the parent execute rule id).
+                prefer = rule.rule_id
+                if rule.phase == "managed" or rule.rule_type.startswith("managed_"):
+                    prefer = None
+                    for r in rays:
+                        for ev in by_ray.get(r, []):
+                            src = (ev.source or "").lower()
+                            if "managed" in src or _norm_action(ev.action) in {
+                                "block", "challenge",
+                            }:
+                                base.security_event_verified = True
+                                base.match_method = "ray_id"
+                                break
+                self._attach_events(base, rays, by_ray, prefer_rule_id=prefer)
+                if base.security_event_verified and base.match_method == "status":
+                    base.match_method = "ray_id"
                 if not base.action_taken:
                     statuses = [
                         o.status_code for o in result.outcomes if o.status_code
@@ -314,74 +322,108 @@ class Correlator:
                     if statuses:
                         base.action_taken = (
                             f"HTTP {', '.join(str(s) for s in statuses)} "
-                            f"(status-based, events pending)"
+                            f"(status-based)"
                         )
                 return base
 
-        # BUG 1 FIX: Flatten the list-of-lists for matched events.
         matched_events: list[FirewallEvent] = []
         for r in rays:
             matched_events.extend(by_ray.get(r, []))
 
-        if matched_events:
-            actions = {_norm_action(ev.action) for ev in matched_events}
+        # Prefer events that cite this exact rule id.
+        rule_matched = [ev for ev in matched_events if ev.rule_id == rule.rule_id]
+        use_events = rule_matched or matched_events
+
+        if use_events:
+            actions = {_norm_action(ev.action) for ev in use_events}
             base.matched_event_ids = [
-                ev.ray_id for ev in matched_events if ev.ray_id
+                ev.ray_id for ev in use_events if ev.ray_id
             ]
             base.timestamps = [
-                ev.datetime for ev in matched_events if ev.datetime
+                ev.datetime for ev in use_events if ev.datetime
             ]
             base.action_taken = ", ".join(sorted(a for a in actions if a))
-            base.match_method = "ray_id"
+            base.match_method = "rule_id" if rule_matched else "ray_id"
+            base.security_event_verified = True
 
-            if base.expected_action in actions:
+            expected = base.expected_action
+            if rule_matched:
+                # Exact rule fired — PASS if action compatible, else FAIL.
+                if not expected or expected in actions or expected == "log" and "log" in actions:
+                    base.verdict = Verdict.PASS
+                    base.details = (
+                        f"Security event verified: rule id {rule.rule_id} fired "
+                        f"on {len(rule_matched)} event(s); action(s) "
+                        f"'{base.action_taken}'."
+                    )
+                else:
+                    base.verdict = Verdict.FAIL
+                    base.details = (
+                        f"Rule id {rule.rule_id} fired but action "
+                        f"'{base.action_taken}' != expected '{expected}'."
+                    )
+                return base
+
+            if expected in actions:
                 base.verdict = Verdict.PASS
                 base.details = (
-                    f"Ray-ID matched {len(matched_events)} event(s); "
+                    f"Ray-ID matched {len(use_events)} event(s); "
                     f"observed action '{base.action_taken}' "
-                    f"matches expected '{base.expected_action}'."
+                    f"matches expected '{expected}'. "
+                    f"(Event rule ids differed from {rule.rule_id} — another "
+                    f"rule may have acted first.)"
                 )
             else:
                 base.verdict = Verdict.FAIL
                 base.details = (
-                    f"Ray-ID matched {len(matched_events)} event(s), "
+                    f"Ray-ID matched {len(use_events)} event(s), "
                     f"but observed action '{base.action_taken}' does not match "
-                    f"expected '{base.expected_action}'."
+                    f"expected '{expected}'."
                 )
             return base
 
-        # No event matched. Distinguish "expected skip" (no event is often
-        # correct for skip rules) from a genuine miss.
         if base.expected_action == "skip":
             base.verdict = Verdict.PASS
             base.details = (
                 "Expected a skip and no block/challenge event was recorded for "
-                "the test requests, consistent with the traffic being allowed "
-                "through. Confirm via the event stream if strict proof is needed."
+                "the test requests, consistent with traffic being allowed through. "
+                "Confirm via Security Events if strict proof is needed."
             )
             base.match_method = "fallback"
             return base
 
-        # For content-type / managed / waf tests we expected a block; absence of
-        # a matching event is a failure to demonstrate enforcement.
+        if base.expected_action == "log":
+            base.verdict = Verdict.FAIL
+            base.details = (
+                f"Expected log action for rule {rule.rule_id} but no matching "
+                f"security event was found for Ray IDs: "
+                f"{', '.join(rays) if rays else '(none)'}."
+            )
+            base.match_method = "ray_id"
+            return base
+
         base.verdict = Verdict.FAIL
         base.details = (
-            "No firewall event matched the test Ray-ID(s) within the window. "
-            "The rule may not have fired, or events had not propagated. "
+            "No firewall/security event matched the test Ray-ID(s) within the "
+            "window. The rule may not have fired, or events had not propagated. "
             f"Ray IDs probed: {', '.join(rays) if rays else '(none captured)'}."
         )
         base.match_method = "ray_id"
         return base
 
-    # ------------------------------------------------------------------ #
-    # BUG 1 FIX: _attach_events now handles list-valued ray map.
     def _attach_events(
         self, evidence: Evidence, rays: list[str],
         by_ray: dict[str, list[FirewallEvent]],
+        prefer_rule_id: str | None = None,
     ) -> None:
         matched: list[FirewallEvent] = []
         for r in rays:
             matched.extend(by_ray.get(r, []))
+        if prefer_rule_id:
+            preferred = [ev for ev in matched if ev.rule_id == prefer_rule_id]
+            if preferred:
+                matched = preferred
+                evidence.security_event_verified = True
         if matched:
             evidence.matched_event_ids = [
                 ev.ray_id for ev in matched if ev.ray_id
@@ -391,3 +433,5 @@ class Correlator:
             ]
             actions = {_norm_action(ev.action) for ev in matched}
             evidence.action_taken = ", ".join(sorted(a for a in actions if a))
+            if any(ev.rule_id == prefer_rule_id for ev in matched):
+                evidence.security_event_verified = True

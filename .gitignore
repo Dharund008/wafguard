@@ -14,3 +14,9 @@ CLAUDE.md
 __pycache__/
 *.py[cod]
 *$py.class
+
+#reports
+reports/
+
+# MISC
+.DS_Store

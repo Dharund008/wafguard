@@ -1,49 +1,32 @@
-"""ContentTypeAdapter — validates content-type enforcement on API hostnames.
-
-Sends POST/PUT/PATCH to services-* hostnames with the wrong content type
-(text/plain instead of application/json); expects a block. Also sends a valid
-JSON request as a negative control that should pass through.
-"""
+"""ContentTypeAdapter — validates content-type enforcement on matching hosts."""
 
 from __future__ import annotations
 
 from .base import BaseTestAdapter, TestPayload
+from .helpers import select_matching_target, target_url
 
 _METHODS = ["POST", "PUT", "PATCH"]
 
 
 class ContentTypeAdapter(BaseTestAdapter):
     name = "content_type"
-    description = "Validates JSON content-type enforcement on API hostnames"
+    description = "Validates JSON content-type enforcement on matching hostnames"
 
     def can_execute(self, rule, config) -> tuple[bool, str]:
-        # Needs a services-* hostname among the targets to be meaningful.
-        api_host = self._api_target(config)
-        if api_host is None:
-            return False, (
-                "No services-* API hostname found in targets. Add one to the "
-                "config to validate content-type enforcement."
-            )
+        target = select_matching_target(rule, config)
+        if target is None:
+            return False, self.manual_playbook(rule, config)
         return True, ""
 
     def expected_action(self, rule) -> str:
-        return rule.action or "block"
-
-    def _api_target(self, config):
-        for t in config.targets:
-            if t.hostname.startswith("services-"):
-                return t
-        return None
+        return (rule.action or "block").lower()
 
     def build_payloads(self, rule, config) -> list[TestPayload]:
-        target = self._api_target(config)
+        target = select_matching_target(rule, config)
         if target is None:
             return []
-        path = target.test_paths.get("default", "/")
-        url = f"{target.protocol}://{target.hostname}{path}"
-
+        url = target_url(target)
         payloads = []
-        # Violating requests: wrong content type, should be blocked.
         for method in _METHODS:
             payloads.append(
                 TestPayload(
@@ -51,19 +34,29 @@ class ContentTypeAdapter(BaseTestAdapter):
                     url=url,
                     headers={"Content-Type": "text/plain"},
                     body="not json",
-                    description=f"{method} with text/plain (should block)",
-                    metadata={"control": False, "method": method},
+                    description=f"{method} with text/plain to {target.hostname}",
+                    metadata={"control": False, "method": method, "rule_id": rule.rule_id},
                 )
             )
-        # Negative control: valid JSON, should pass.
         payloads.append(
             TestPayload(
                 method="POST",
                 url=url,
                 headers={"Content-Type": "application/json"},
                 body="{}",
-                description="POST with valid application/json (should pass)",
-                metadata={"control": True, "method": "POST"},
+                description=f"POST application/json to {target.hostname} (control)",
+                metadata={"control": True, "method": "POST", "rule_id": rule.rule_id},
             )
         )
         return payloads
+
+    def manual_playbook(self, rule, config) -> str:
+        hosts = (rule.extracted_params or {}).get("hosts") or []
+        return (
+            f"Rule: {rule.description} ({rule.rule_id})\n"
+            f"Needs a target hostname matching: {hosts or rule.expression}\n"
+            f"1. Add a matching hostname under targets: in the zone config.\n"
+            f"2. Re-run, or manually:\n"
+            f"   curl -X POST https://<matching-host>/ -H 'Content-Type: text/plain' -d 'x'\n"
+            f"3. Confirm rule {rule.rule_id} action '{self.expected_action(rule)}' in Security Events."
+        )

@@ -5,7 +5,7 @@ Orchestrates the 6-stage pipeline:
   bootstrap → discovery → classification → execution → reconciliation → report
 
 Two invocation modes:
-  * config-driven:  --config zones/aptechdevlab.yaml
+  * config-driven:  --config zones/<zone>.yaml
   * ad-hoc:         --hostname H --zone-id Z [--api-token T]
 """
 
@@ -15,6 +15,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timezone
 
 from engine import __version__, config as config_mod
@@ -45,7 +46,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("-c", "--config", help="Path to YAML config file (config-driven mode).")
     p.add_argument("-H", "--hostname", help="Target hostname (ad-hoc mode).")
     p.add_argument("-z", "--zone-id", help="Cloudflare zone ID (ad-hoc mode).")
-    p.add_argument("-a", "--account-id", help="Cloudflare account ID (for IP-list reads).")
+    p.add_argument("-a", "--account-id", help="Cloudflare account ID (auto-resolved from zone if omitted).")
     p.add_argument("-t", "--api-token", help="CF API token (else read from CF_API_TOKEN).")
     p.add_argument("-o", "--output-dir", default="./reports", help="Report output directory.")
     p.add_argument("-f", "--format", default="html", choices=["html", "json", "both"],
@@ -79,14 +80,17 @@ def _build_config(args) -> config_mod.Config:
 
 def _print_plan(rules, phase_filter) -> None:
     print("\n=== Discovery / classification plan ===")
-    print(f"{'STATE':<9} {'PHASE':<10} {'TYPE':<18} {'ADAPTER':<22} DESCRIPTION")
-    print("-" * 96)
+    print(f"{'STATE':<9} {'SCOPE':<8} {'PHASE':<10} {'TYPE':<18} {'ADAPTER':<22} DESCRIPTION")
+    print("-" * 110)
     for r in rules:
         if "all" not in phase_filter and r.phase not in phase_filter:
             continue
         state = "enabled" if r.enabled else "disabled"
         adapter = r.adapter_class or "(manual)"
-        print(f"{state:<9} {r.phase:<10} {r.rule_type:<18} {adapter:<22} {r.description}")
+        print(
+            f"{state:<9} {r.scope:<8} {r.phase:<10} {r.rule_type:<18} "
+            f"{adapter:<22} {r.description}"
+        )
     print()
 
 
@@ -106,6 +110,8 @@ def main(argv=None) -> int:
         cfg.output_dir = args.output_dir
     if args.format:
         cfg.output_format = args.format
+    if args.account_id and not cfg.account_id:
+        cfg.account_id = args.account_id
 
     client = CloudflareClient(
         api_token=cfg.api_token,
@@ -115,6 +121,7 @@ def main(argv=None) -> int:
         max_retries=int(cfg.options.get("event_poll_retries", 3)),
         timeout=int(cfg.options.get("request_timeout", 10)) + 5,
     )
+    cfg._cf_client = client
 
     api_status = "connected"
     try:
@@ -122,15 +129,24 @@ def main(argv=None) -> int:
             log.error("API token is not active. Check its status in the Cloudflare dashboard.")
             return 3
         log.info("API token verified.")
+        info = client.get_zone_info()
+        if info.account_id:
+            cfg.account_id = info.account_id
+        log.info(
+            "Zone %s (plan=%s) account=%s",
+            info.name or cfg.zone_id,
+            info.plan_legacy_id or info.plan_name or "?",
+            cfg.account_id or "?",
+        )
     except AuthenticationError as exc:
         log.error("Authentication failed: %s", exc)
         return 3
     except CFError as exc:
-        log.warning("Token verify call failed (%s); continuing, but discovery may fail.", exc)
+        log.warning("Token/zone bootstrap failed (%s); continuing.", exc)
         api_status = "unverified"
 
     # ---- Stage 2+3: discovery + classification --------------------- #
-    log.info("Discovering rules for zone %s…", cfg.zone_id)
+    log.info("Discovering account + zone rules for %s…", cfg.zone_id)
     try:
         rules = DiscoveryService(client).discover()
     except CFError as exc:
@@ -138,7 +154,7 @@ def main(argv=None) -> int:
         return 4
 
     if not rules:
-        log.error("No rules discovered. Check zone ID and token permissions.")
+        log.error("No rules discovered. Check zone/account IDs and token permissions.")
         return 4
 
     log.info("Discovered %s rules.", len(rules))
@@ -151,20 +167,27 @@ def main(argv=None) -> int:
 
     if args.dry_run:
         _print_plan(rules, args.phase)
+        log.info(
+            "Coverage: total=%s enabled=%s auto_testable=%s account=%s zone=%s unknown=%s",
+            coverage.total, coverage.enabled, coverage.auto_testable,
+            coverage.account, coverage.zone, coverage.unknown,
+        )
         log.info("Dry run complete — no requests sent.")
         return 0
 
     # ---- Stage 4: execution ---------------------------------------- #
-    # Open an Instant Logs WebSocket session BEFORE firing payloads.
-    # Events stream in real-time — zero propagation delay.
-    # If Instant Logs is unavailable, we fall back to GraphQL after execution.
     instant_logs_events = None
     il_session = None
+    il_active = False
+
+    host_filter = None
+    if cfg.options.get("instant_logs_host_filter", True) and len(cfg.targets) == 1:
+        host_filter = cfg.primary_target().hostname
 
     try:
         from engine.instant_logs import InstantLogsSession
         il_session = InstantLogsSession(client=client, zone_id=cfg.zone_id)
-        il_active = il_session.start()
+        il_active = il_session.start(host_filter=host_filter)
     except ImportError:
         log.info("websockets library not installed; using GraphQL fallback.")
         il_active = False
@@ -173,20 +196,38 @@ def main(argv=None) -> int:
         il_active = False
 
     if il_active:
-        log.info("Instant Logs active — events will be captured in real-time.")
+        log.info("Instant Logs active — events captured in real-time.")
+        # Warmup request so we know the stream is delivering before tests.
+        try:
+            import requests as _req
+            warm = cfg.primary_target()
+            warm_url = f"{warm.protocol}://{warm.hostname}{warm.test_paths.get('default', '/')}"
+            wr = _req.get(
+                warm_url,
+                timeout=int(cfg.options.get("request_timeout", 10)),
+                headers={"User-Agent": cfg.options.get("user_agent", "WAF-Validator/1.0")},
+                verify=cfg.options.get("verify_ssl", True),
+            )
+            log.info(
+                "Instant Logs warmup → HTTP %s ray=%s (buffered=%s)",
+                wr.status_code,
+                (wr.headers.get("cf-ray") or "").split("-")[0] or "?",
+                il_session.event_count if il_session else 0,
+            )
+            time.sleep(1.0)
+        except Exception as exc:
+            log.warning("Instant Logs warmup failed: %s", exc)
     else:
-        log.info("Using GraphQL Analytics for event correlation (may be slower).")
+        log.info("Using GraphQL Analytics for event correlation (may be slower/sampled).")
 
     log.info("Executing tests (live)…")
     engine = TestEngine(cfg)
     results = engine.run(rules_scoped)
 
-    # Close the Instant Logs session and collect events.
     if il_active and il_session is not None:
         try:
             from engine.instant_logs import InstantLogsSession
-            raw_events = il_session.stop(drain_seconds=3.0)
-            # Expand multi-match log lines into individual FirewallEvent objects.
+            il_session.stop(drain_seconds=float(cfg.options.get("instant_logs_drain", 5.0)))
             instant_logs_events = InstantLogsSession.expand_events(
                 il_session._raw_messages
             )
@@ -199,13 +240,19 @@ def main(argv=None) -> int:
             instant_logs_events = None
 
     # ---- Stage 5: reconciliation ----------------------------------- #
-    log.info("Reconciling results against firewall events…")
+    log.info("Reconciling results against firewall/security events…")
     correlator = Correlator(client, cfg)
+    # If Instant Logs returned an empty list, treat as "tried but empty" and
+    # still allow hybrid/GraphQL fill via preloaded_events=[].
     evidence = correlator.reconcile(
         results,
         engine.window_start,
         engine.window_end,
-        preloaded_events=instant_logs_events,
+        preloaded_events=instant_logs_events if il_active else None,
+    )
+    log.info(
+        "Evidence source: %s — %s",
+        correlator.evidence_source, correlator.evidence_note,
     )
 
     # ---- Stage 6: report ------------------------------------------- #
@@ -215,13 +262,17 @@ def main(argv=None) -> int:
     now = datetime.now(timezone.utc)
     date = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H%M%S")
-    stem = cfg.filename_template.format(zone=cfg.zone_name, hostname=hostname, date=date, time=time_str)
+    stem = cfg.filename_template.format(
+        zone=cfg.zone_name, hostname=hostname, date=date, time=time_str,
+    )
 
     written = []
     if cfg.output_format in ("html", "both"):
         html = render_html(
             zone=cfg.zone_name, hostname=hostname, evidence=evidence,
             coverage=coverage, disabled_rules=disabled_rules, api_status=api_status,
+            evidence_source=correlator.evidence_source,
+            evidence_note=correlator.evidence_note,
         )
         path = os.path.join(cfg.output_dir, f"{stem}.html")
         with open(path, "w", encoding="utf-8") as fh:
@@ -231,6 +282,8 @@ def main(argv=None) -> int:
         js = render_json(
             zone=cfg.zone_name, hostname=hostname, evidence=evidence,
             coverage=coverage, disabled_rules=disabled_rules,
+            evidence_source=correlator.evidence_source,
+            evidence_note=correlator.evidence_note,
         )
         path = os.path.join(cfg.output_dir, f"{stem}.json")
         with open(path, "w", encoding="utf-8") as fh:
@@ -240,15 +293,19 @@ def main(argv=None) -> int:
     # ---- Summary --------------------------------------------------- #
     from engine.testers import Verdict
     counts = {v.value: 0 for v in Verdict}
+    verified = 0
     for e in evidence:
         counts[e.verdict.value] += 1
+        if e.security_event_verified:
+            verified += 1
     print("\n=== Summary ===")
     print(f"  Passed: {counts['PASS']}   Failed: {counts['FAIL']}   "
           f"Manual: {counts['MANUAL']}   Error: {counts['ERROR']}")
+    print(f"  Security-event verified: {verified}/{len(evidence)}")
+    print(f"  Evidence source: {correlator.evidence_source}")
     for path in written:
         print(f"  Report: {path}")
 
-    # Non-zero exit if any hard failures (useful for CI).
     return 1 if counts["FAIL"] else 0
 
 

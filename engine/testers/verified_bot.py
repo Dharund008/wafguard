@@ -1,72 +1,68 @@
-"""VerifiedBotAdapter and APITrafficAdapter.
-
-VerifiedBotAdapter: "Good Bots" rules skip verified crawlers. Verified status
-is an upstream classification that cannot be spoofed client-side, so this is
-always MANUAL — the operator checks the event stream for real crawler traffic.
-
-APITrafficAdapter: rules that skip the super-bot-fight-management phase for
-services-* API hosts. Partially automatable: we can send a request to the API
-host and confirm the skip appears in the event stream, but the "verified API
-client" nuance may require manual confirmation.
-"""
+"""VerifiedBotAdapter and APITrafficAdapter."""
 
 from __future__ import annotations
 
 from .base import BaseTestAdapter, TestPayload
+from .helpers import select_matching_target, target_url
 
 
 class VerifiedBotAdapter(BaseTestAdapter):
     name = "verified_bot"
-    description = "Validates verified-bot skip rules (manual)"
+    description = "Validates verified-bot skip rules"
 
     def can_execute(self, rule, config) -> tuple[bool, str]:
-        return False, (
-            "Verified bot status is assigned by Cloudflare to known crawler "
-            "infrastructure (Googlebot, Bingbot, etc.) and cannot be simulated. "
-            "Validate manually: query the event stream for verified-bot traffic "
-            "and confirm the 'skip' action was applied."
-        )
+        # Physically cannot spoof Cloudflare verified-bot classification.
+        return False, self.manual_playbook(rule, config)
 
     def expected_action(self, rule) -> str:
-        return rule.action or "skip"
+        return (rule.action or "skip").lower()
 
     def build_payloads(self, rule, config) -> list[TestPayload]:
         return []
 
+    def manual_playbook(self, rule, config) -> str:
+        return (
+            f"Rule: {rule.description} ({rule.rule_id})\n"
+            f"Verified bot status is assigned by Cloudflare to known crawlers "
+            f"(Googlebot, Bingbot, etc.) and cannot be simulated client-side.\n"
+            f"1. In Security Events, filter Source ≈ firewallCustom and "
+            f"rule id {rule.rule_id} (or description contains 'Good Bots' / verified).\n"
+            f"2. Confirm action '{self.expected_action(rule)}' on real crawler traffic.\n"
+            f"3. Expression for reference: {rule.expression}"
+        )
+
 
 class APITrafficAdapter(BaseTestAdapter):
     name = "api_traffic"
-    description = "Validates API-traffic bot-skip rules (partial)"
+    description = "Validates host-scoped skip/allow rules (e.g. API traffic)"
 
     def can_execute(self, rule, config) -> tuple[bool, str]:
-        api_host = next(
-            (t for t in config.targets if t.hostname.startswith("services-")),
-            None,
-        )
-        if api_host is None:
-            return False, (
-                "No services-* hostname in targets. Add one to validate the "
-                "API-traffic skip rule."
-            )
+        if select_matching_target(rule, config) is None:
+            return False, self.manual_playbook(rule, config)
         return True, ""
 
     def expected_action(self, rule) -> str:
-        return rule.action or "skip"
+        return (rule.action or "skip").lower()
 
     def build_payloads(self, rule, config) -> list[TestPayload]:
-        target = next(
-            (t for t in config.targets if t.hostname.startswith("services-")),
-            None,
-        )
+        target = select_matching_target(rule, config)
         if target is None:
             return []
-        path = target.test_paths.get("default", "/")
-        url = f"{target.protocol}://{target.hostname}{path}"
+        url = target_url(target)
         return [
             TestPayload(
                 method="GET",
                 url=url,
-                description="Request to services-* host; expect SBFM skip",
-                metadata={"partial": True},
+                description=f"Host-scoped probe to {target.hostname}; expect {self.expected_action(rule)}",
+                metadata={"rule_id": rule.rule_id},
             )
         ]
+
+    def manual_playbook(self, rule, config) -> str:
+        hosts = (rule.extracted_params or {}).get("hosts") or []
+        return (
+            f"Rule: {rule.description} ({rule.rule_id})\n"
+            f"Add a target hostname matching {hosts or rule.expression}, then re-run.\n"
+            f"Or manually: curl -sI https://<matching-host>/ and confirm rule "
+            f"{rule.rule_id} action '{self.expected_action(rule)}' in Security Events / Instant Logs."
+        )
