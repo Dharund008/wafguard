@@ -1,13 +1,9 @@
-"""HostMethodAdapter — validates host + HTTP method block rules.
-
-Handles rules like: block POST to hosts containing "pronto-training".
-Sends the blocked method as a positive test (expect block) and GET as a
-negative control (expect pass).
-"""
+"""HostMethodAdapter — validates host + HTTP method rules."""
 
 from __future__ import annotations
 
 from .base import BaseTestAdapter, TestPayload, TestResult, Verdict
+from .helpers import select_matching_target, target_url
 
 
 class HostMethodAdapter(BaseTestAdapter):
@@ -15,79 +11,68 @@ class HostMethodAdapter(BaseTestAdapter):
     description = "Validates host + HTTP method block rules"
 
     def can_execute(self, rule, config) -> tuple[bool, str]:
-        host_substr = rule.extracted_params.get("host", "")
-        for target in config.targets:
-            if host_substr in target.hostname:
-                return True, ""
-        return False, (
-            f"No configured target hostname contains \"{host_substr}\". "
-            f"Add a target with \"{host_substr}\" in its hostname to test this rule."
-        )
+        if select_matching_target(rule, config) is None:
+            return False, self.manual_playbook(rule, config)
+        return True, ""
 
     def expected_action(self, rule) -> str:
-        return rule.action or "block"
+        return (rule.action or "block").lower()
 
     def build_payloads(self, rule, config) -> list[TestPayload]:
-        host_substr = rule.extracted_params.get("host", "")
-        methods = rule.extracted_params.get("methods", ["POST"])
-
-        target = None
-        for t in config.targets:
-            if host_substr in t.hostname:
-                target = t
-                break
-
+        target = select_matching_target(rule, config)
         if not target:
             return []
-
-        path = target.test_paths.get("default", "/")
-        base_url = f"{target.protocol}://{target.hostname}{path}"
+        methods = rule.extracted_params.get("methods") or ["POST"]
+        url = target_url(target)
         payloads = []
-
         for method in methods:
+            body = "{}" if method in {"POST", "PUT", "PATCH"} else None
+            headers = {"Content-Type": "application/json"} if body else {}
             payloads.append(TestPayload(
                 method=method,
-                url=base_url,
-                description=f"{method} to {target.hostname} (expect block)",
+                url=url,
+                headers=headers,
+                body=body,
+                description=f"{method} to {target.hostname} (expect {self.expected_action(rule)})",
+                metadata={"rule_id": rule.rule_id},
             ))
-
         if "GET" not in methods:
             payloads.append(TestPayload(
                 method="GET",
-                url=base_url,
-                description=f"GET to {target.hostname} (negative control, expect pass)",
-                metadata={"negative_control": True},
+                url=url,
+                description=f"GET to {target.hostname} (negative control)",
+                metadata={"negative_control": True, "rule_id": rule.rule_id},
             ))
-
         return payloads
 
-    def interpret(self, result: TestResult, correlated) -> tuple[Verdict, str]:
+    def interpret(self, result: TestResult, correlated) -> tuple[Verdict | None, str]:
         if not result.outcomes:
             return None, ""
-
-        blocked = []
-        passed = []
-        for o in result.outcomes:
-            if o.payload.metadata.get("negative_control"):
-                passed.append(o)
-            else:
-                blocked.append(o)
-
+        blocked = [o for o in result.outcomes if not o.payload.metadata.get("negative_control")]
+        passed = [o for o in result.outcomes if o.payload.metadata.get("negative_control")]
         blocked_statuses = [o.status_code for o in blocked if o.status_code]
         passed_statuses = [o.status_code for o in passed if o.status_code]
+        expected = result.expected_action
 
-        if blocked_statuses and all(s == 403 for s in blocked_statuses):
-            methods = ", ".join(o.payload.method for o in blocked)
-            if passed_statuses and all(s < 400 for s in passed_statuses):
-                ctrl_methods = ", ".join(o.payload.method for o in passed)
-                return Verdict.PASS, (
-                    f"Blocked method(s) [{methods}] returned 403. "
-                    f"Negative control [{ctrl_methods}] returned "
-                    f"{passed_statuses[0]} (passed through). "
-                    f"Rule is selectively enforcing on the correct methods."
-                )
-            return Verdict.PASS, (
-                f"Blocked method(s) [{methods}] returned 403. "
-                f"Rule is enforcing correctly."
-            )
+        # Prefer event correlation when available; only assert on hard blocks via status.
+        if expected in {"block", "managed_challenge", "challenge"} and blocked_statuses:
+            if all(s in (403, 429, 503) for s in blocked_statuses):
+                if passed_statuses and all(s < 400 for s in passed_statuses):
+                    return Verdict.PASS, (
+                        f"Blocked method(s) returned {blocked_statuses}; "
+                        f"negative control returned {passed_statuses}."
+                    )
+                return Verdict.PASS, f"Blocked method(s) returned {blocked_statuses}."
         return None, ""
+
+    def manual_playbook(self, rule, config) -> str:
+        hosts = (rule.extracted_params or {}).get("hosts") or [
+            (rule.extracted_params or {}).get("host", "")
+        ]
+        methods = (rule.extracted_params or {}).get("methods") or []
+        return (
+            f"Rule: {rule.description} ({rule.rule_id})\n"
+            f"Add a target matching host(s) {hosts} then re-run, or:\n"
+            f"  curl -X {methods[0] if methods else 'POST'} https://<matching-host>/\n"
+            f"Confirm rule {rule.rule_id} action '{self.expected_action(rule)}' in Security Events."
+        )

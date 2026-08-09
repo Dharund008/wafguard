@@ -63,7 +63,7 @@ class InstantLogsSession:
     _session_id: str | None = None
 
     # ------------------------------------------------------------------ #
-    def start(self) -> bool:
+    def start(self, host_filter: str | None = None) -> bool:
         """Create the Instant Logs job and open the WebSocket.
 
         Returns True if the session is active and collecting events.
@@ -71,7 +71,7 @@ class InstantLogsSession:
         fall back to GraphQL).
         """
         try:
-            self._ws_url = self._create_session()
+            self._ws_url = self._create_session(host_filter=host_filter)
         except Exception as exc:
             log.warning(
                 "Instant Logs session creation failed (%s). "
@@ -146,13 +146,24 @@ class InstantLogsSession:
     # ------------------------------------------------------------------ #
     # Internal: session creation
     # ------------------------------------------------------------------ #
-    def _create_session(self) -> str | None:
-        """POST to the logpush/edge/jobs endpoint to get a WSS URL."""
+    def _create_session(self, host_filter: str | None = None) -> str | None:
+        """POST to the logpush/edge/jobs endpoint to get a WSS URL.
+
+        Optionally filter to a ClientRequestHost to reduce noise on busy zones.
+        Instant Logs: Business/Enterprise only; one active session per zone.
+        """
         url = f"{REST_BASE}/zones/{self.zone_id}/logpush/edge/jobs"
+        filter_expr = ""
+        if host_filter:
+            # Build without an f-string so JSON braces are not misparsed.
+            filter_expr = (
+                '{"where":{"and":[{"key":"ClientRequestHost","operator":"eq",'
+                '"value":"' + host_filter + '"}]}}'
+            )
         payload = {
             "fields": _INSTANT_LOGS_FIELDS,
-            "sample": 1,
-            "filter": "",
+            "sample": 1,  # 1 = 100% of records
+            "filter": filter_expr,
             "kind": "instant-logs",
         }
         # Use the client's internal _request for auth/retry/throttle.
@@ -189,6 +200,8 @@ class InstantLogsSession:
             daemon=True,
         )
         self._thread.start()
+        # Brief settle so the edge attaches before probes fire.
+        time.sleep(1.5)
 
     # ------------------------------------------------------------------ #
     def _reader_loop(self) -> None:
@@ -216,6 +229,8 @@ class InstantLogsSession:
                     )
         except Exception as exc:
             if self._running:
+                log.warning("Instant Logs reader ended: %s", exc)
+            else:
                 log.debug("Instant Logs reader ended: %s", exc)
         finally:
             self._running = False

@@ -1,46 +1,51 @@
 # ===== Cloudflare WAF Validation Framework — Zone Config =====
 # Copy this file to zones/<zone>.yaml and fill in the values.
+# Designed as a cutover standard: works for any zone/account, not one project.
 
 zone:
-  name: aptechdevlab.com
-  zone_id: "654c921dfe0f5347ba16235f925137e5"
-  account_id: "your-account-id"          # required only for IP-list reads
+  name: example.com
+  zone_id: "your-zone-id"
+  # Optional — auto-resolved from the zone API when omitted:
+  # account_id: "your-account-id"
 
 api:
-  token_env: "CF_API_TOKEN"              # name of the env var holding the token
+  token_env: "CF_API_TOKEN"
 
 targets:
-  - hostname: pronto.aptechdevlab.com
+  - hostname: www.example.com
     protocol: https
     test_paths:
       default: /
       api: /api/v1/health
-  # Add a services-* host to exercise the content-type / API-traffic adapters:
-  # - hostname: services-us-east-1.aptechdevlab.com
+  # Add every hostname class your WAF expressions mention (api/services/etc.):
+  # - hostname: services-us-east-1.example.com
   #   protocol: https
   #   test_paths:
   #     default: /
 
-# Optional: source IPs that belong to the named lists. Supplying these makes
-# the IP-list rules auto-testable (the runner must egress from that IP).
+# Map Cloudflare IP list names (without $) to an egress IP this runner uses.
+# If omitted, the tool checks whether the runner's public IP is already a
+# member of the list and auto-tests when it is.
 test_ips:
-  whitelisted: null                      # IP in $ap_whitelist
-  blocked: null                          # IP in $ap_blacklist
-  bypass: null                           # IP in $ap_bypasslist
-  rate_bypass: null                      # IP in $ap_ratecontrol_bypass
+  # my_whitelist: "203.0.113.10"
+  # my_blocklist: "198.51.100.20"
 
 options:
-  request_timeout: 10                    # seconds per request
-  rate_limit_buffer: 2                   # extra requests beyond the threshold
-  event_poll_delay: 30                   # seconds to wait before querying events
-  event_poll_retries: 6                  # event-fetch retry attempts
-  event_poll_interval: 10                # seconds between event-fetch retries
-  verify_ssl: true                       # TLS verification for target requests
-  user_agent: "AP-WAF-Validator/1.0"
-  inter_request_delay: 0.0               # seconds between rate-limit loop requests
-  socks_proxy: null                      # e.g. socks5h://127.0.0.1:9050 for geo tests
+  request_timeout: 10
+  rate_limit_buffer: 2
+  rate_limit_max_auto: 600
+  event_poll_delay: 30
+  event_poll_retries: 6
+  event_poll_interval: 10
+  hybrid_graphql_fill: true
+  # Host filter can drop events on some zones; Ray-ID match is enough.
+  instant_logs_host_filter: false
+  verify_ssl: true
+  user_agent: "WAF-Validator/1.0"
+  inter_request_delay: 0.25
+  socks_proxy: null                # e.g. socks5h://127.0.0.1:9050 for geo/Tor (T1)
 
 output:
-  format: html                           # html | json | both
+  format: html                     # html | json | both
   directory: ./reports
   filename_template: "waf_validation_{zone}_{hostname}_{date}_{time}"

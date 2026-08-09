@@ -46,10 +46,12 @@ class TestEngine:
 
         for rule in rules:
             if not rule.enabled:
-                # Disabled rules are out of test scope; the reporter lists them
-                # separately. We skip execution but keep a record.
                 continue
             results.append(self._run_one(rule))
+            # Pace between rules so Instant Logs can keep up on busy zones.
+            delay = float(self.config.options.get("inter_request_delay", 0.0))
+            if delay:
+                time.sleep(delay)
 
         self.window_end = datetime.now(timezone.utc)
         return results
@@ -59,15 +61,16 @@ class TestEngine:
         adapter = get_adapter(rule.adapter_class) if rule.adapter_class else None
 
         if adapter is None:
+            playbook = (
+                rule.manual_reason
+                or "No adapter is available for this rule type."
+            )
             return TestResult(
                 rule=rule,
                 adapter_name="(none)",
                 expected_action=rule.action or "unknown",
                 preflight_verdict=Verdict.MANUAL,
-                preflight_reason=(
-                    rule.manual_reason
-                    or "No adapter is available for this rule type."
-                ),
+                preflight_reason=playbook,
             )
 
         executable, reason = adapter.can_execute(rule, self.config)
@@ -79,7 +82,7 @@ class TestEngine:
                 adapter_name=adapter.name,
                 expected_action=expected,
                 preflight_verdict=Verdict.MANUAL,
-                preflight_reason=reason,
+                preflight_reason=reason or adapter.manual_playbook(rule, self.config),
             )
 
         result = TestResult(
@@ -146,7 +149,8 @@ class TestEngine:
                 error = str(exc)
                 per_request_status.append(-1)
                 log.warning("Request error for %s: %s", payload.url, exc)
-            if inter_delay and i < payload.repeat - 1:
+            # Always pace between requests (and between payloads via engine).
+            if inter_delay:
                 time.sleep(inter_delay)
 
         duration_ms = (time.monotonic() - start) * 1000.0

@@ -2,9 +2,8 @@
 
 Every test adapter implements the BaseTestAdapter contract. The test engine
 interacts with adapters only through this interface — never through concrete
-types. This is the strategy-pattern seam that makes the framework extensible:
-adding a new rule type is a matter of dropping a new adapter module in this
-package and registering one expression pattern in discovery.py.
+types. Adding a new rule type is a matter of dropping a new adapter module in
+this package and registering one expression pattern in discovery.py.
 """
 
 from __future__ import annotations
@@ -64,26 +63,14 @@ class TestResult:
 
 
 class BaseTestAdapter(ABC):
-    """Contract implemented by every adapter.
-
-    Subclasses set ``name`` and ``description`` as class attributes and are
-    auto-registered by ``testers/__init__.py`` at import time.
-    """
+    """Contract implemented by every adapter."""
 
     name: str = "base"
     description: str = "Abstract base adapter"
 
-    # ------------------------------------------------------------------ #
-    # Contract methods
-    # ------------------------------------------------------------------ #
     @abstractmethod
     def can_execute(self, rule, config) -> tuple[bool, str]:
-        """Pre-flight check.
-
-        Returns ``(executable, reason_if_not)``. If ``executable`` is False the
-        engine records the rule as MANUAL with the returned reason and sends no
-        requests.
-        """
+        """Pre-flight check. Returns ``(executable, reason_if_not)``."""
         raise NotImplementedError
 
     @abstractmethod
@@ -93,20 +80,26 @@ class BaseTestAdapter(ABC):
 
     @abstractmethod
     def expected_action(self, rule) -> str:
-        """What Cloudflare should do when the payload hits: block | challenge |
-        skip | log."""
+        """What Cloudflare should do: block | challenge | skip | log."""
         raise NotImplementedError
 
-    # ------------------------------------------------------------------ #
-    # Optional hook — adapters may override to interpret their own results
-    # beyond the generic action-match the correlator performs.
-    # ------------------------------------------------------------------ #
-    def interpret(self, result: "TestResult", correlated) -> tuple[Verdict, str]:
+    def interpret(self, result: "TestResult", correlated) -> tuple[Verdict | None, str]:
         """Optional adapter-specific verdict refinement.
 
-        Default implementation returns ``(None, "")`` meaning "defer to the
-        correlator's generic action-match logic". Adapters like the rate-limit
-        tester override this to assert on observed HTTP status transitions
-        instead of (or in addition to) event correlation.
+        Return ``(None, "")`` to defer to the correlator's generic action-match.
         """
-        return None, ""  # type: ignore[return-value]
+        return None, ""
+
+    def manual_playbook(self, rule, config) -> str:
+        """Copy-paste steps when automation is genuinely impossible."""
+        action = self.expected_action(rule)
+        return (
+            f"Rule: {rule.description} ({rule.rule_id})\n"
+            f"Scope: {getattr(rule, 'scope', 'zone')} / phase {rule.phase}\n"
+            f"Expression: {rule.expression}\n"
+            f"Expected action: {action}\n"
+            f"1. Send a request that satisfies the expression to a covered hostname.\n"
+            f"2. Note the CF-Ray response header.\n"
+            f"3. In Security Events or Instant Logs, confirm rule id {rule.rule_id} "
+            f"fired with action '{action}'."
+        )

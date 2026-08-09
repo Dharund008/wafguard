@@ -21,16 +21,18 @@ class ConfigError(Exception):
 _DEFAULT_OPTIONS = {
     "request_timeout": 10,
     "rate_limit_buffer": 5,
-    # BUG 3 FIX: CF analytics can take 2-5 min to propagate to GraphQL.
-    # Previous defaults (5s delay, 3 retries, 5s interval = 20s max) caused
-    # frequent false FAILs due to events not yet being queryable.
+    "rate_limit_max_auto": 600,
+    # GraphQL analytics can take 2-5 min to propagate.
     "event_poll_delay": 30,
     "event_poll_retries": 6,
     "event_poll_interval": 10,
+    "hybrid_graphql_fill": True,
+    "instant_logs_host_filter": False,
     "verify_ssl": True,
-    "user_agent": "AP-WAF-Validator/1.0",
+    "user_agent": "WAF-Validator/1.0",
     "socks_proxy": None,
-    "inter_request_delay": 0.0,
+    # Pace probes so Instant Logs can deliver one line per request.
+    "inter_request_delay": 0.25,
 }
 
 
@@ -53,6 +55,8 @@ class Config:
     output_format: str = "html"
     output_dir: str = "./reports"
     filename_template: str = "waf_validation_{zone}_{hostname}_{date}_{time}"
+    # Attached at runtime by the CLI so adapters can query CF APIs (lists, etc.).
+    _cf_client: object | None = field(default=None, repr=False, compare=False)
 
     # ------------------------------------------------------------------ #
     def primary_target(self) -> Target:

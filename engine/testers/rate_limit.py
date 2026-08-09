@@ -10,6 +10,7 @@ observed client-side at the moment the threshold trips.
 from __future__ import annotations
 
 from .base import BaseTestAdapter, TestPayload, TestResult, Verdict
+from .helpers import target_url
 
 # Status codes Cloudflare returns when a rate-limit mitigation engages.
 _MITIGATION_CODES = {429, 403, 503}
@@ -22,15 +23,21 @@ class RateLimitAdapter(BaseTestAdapter):
     def can_execute(self, rule, config) -> tuple[bool, str]:
         params = rule.extracted_params or {}
         if not params.get("requests_per_period"):
+            return False, self.manual_playbook(rule, config)
+        # Skip extremely high thresholds unless explicitly allowed — still
+        # auto-testable, but warn via notes; do not force MANUAL.
+        threshold = int(params.get("requests_per_period") or 0)
+        max_auto = int(config.options.get("rate_limit_max_auto", 600))
+        if threshold > max_auto:
             return False, (
-                "Could not extract requests_per_period from the rule; "
-                "verify the rate-limit configuration manually."
+                f"Threshold {threshold} exceeds rate_limit_max_auto={max_auto}. "
+                f"Raise options.rate_limit_max_auto to auto-test, or follow:\n"
+                + self.manual_playbook(rule, config)
             )
         return True, ""
 
     def expected_action(self, rule) -> str:
-        # Rate-limit rules carry their own action (managed_challenge / block).
-        return rule.action or "managed_challenge"
+        return (rule.action or "managed_challenge").lower()
 
     def build_payloads(self, rule, config) -> list[TestPayload]:
         params = rule.extracted_params or {}
@@ -39,9 +46,12 @@ class RateLimitAdapter(BaseTestAdapter):
         total = threshold + buffer
 
         method = params.get("method", "GET")
+        # 404 counting rules need a missing path.
         target = config.primary_target()
-        path = target.test_paths.get("default", "/")
-        url = f"{target.protocol}://{target.hostname}{path}"
+        if rule.rule_type == "rate_limit_404":
+            url = f"{target.protocol}://{target.hostname}/waf-validator-404-probe-{threshold}"
+        else:
+            url = target_url(target)
 
         headers = {}
         if method in {"POST", "PUT", "PATCH"}:
@@ -63,38 +73,77 @@ class RateLimitAdapter(BaseTestAdapter):
                     f"(threshold={threshold}, buffer={buffer})"
                 ),
                 repeat=total,
-                metadata={"threshold": threshold, "total": total},
+                metadata={
+                    "threshold": threshold,
+                    "total": total,
+                    "rule_id": rule.rule_id,
+                },
             )
         ]
 
-    def interpret(self, result: TestResult, correlated) -> tuple[Verdict, str]:
-        """Assert enforcement engaged at or shortly after the threshold."""
+    def interpret(self, result: TestResult, correlated) -> tuple[Verdict | None, str]:
+        """Assert enforcement engaged; also accept rule-id evidence for log actions."""
         if not result.outcomes:
             return Verdict.ERROR, "No requests were sent."
 
         outcome = result.outcomes[0]
-        # The engine records per-request statuses in metadata for repeat>1.
-        statuses = outcome.metadata.get("per_request_status", []) if hasattr(outcome, "metadata") else []
-        # RequestOutcome has no metadata field by default; the engine stashes
-        # the per-request list on the payload metadata instead.
         statuses = outcome.payload.metadata.get("per_request_status", [])
         threshold = outcome.payload.metadata.get("threshold", 0)
+        rule_id = result.rule.rule_id
+        expected = (result.expected_action or "").lower()
+
+        # Event proof by rule id (works for action=log as well as mitigations).
+        rays = set()
+        for o in result.outcomes:
+            if o.cf_ray_id:
+                rays.add(o.cf_ray_id.split("-")[0])
+            for r in o.payload.metadata.get("rays", []):
+                rays.add(str(r).split("-")[0])
+        rule_hits = []
+        for ray in rays:
+            for ev in correlated.get(ray, []):
+                if ev.rule_id == rule_id:
+                    rule_hits.append(ev)
 
         if not statuses:
+            if rule_hits:
+                return Verdict.PASS, (
+                    f"Rate-limit rule {rule_id} matched in event stream "
+                    f"({len(rule_hits)} event(s))."
+                )
             return Verdict.ERROR, "No per-request status data captured."
 
         trip_index = next(
             (i for i, s in enumerate(statuses) if s in _MITIGATION_CODES),
             None,
         )
-        if trip_index is None:
-            return Verdict.FAIL, (
-                f"Sent {len(statuses)} requests; no mitigation status "
-                f"({sorted(_MITIGATION_CODES)}) observed. Rate limit may not be firing."
+        if trip_index is not None:
+            return Verdict.PASS, (
+                f"Mitigation engaged at request #{trip_index + 1} "
+                f"(threshold={threshold}). Observed status {statuses[trip_index]}."
             )
 
-        trip_request = trip_index + 1  # 1-indexed for humans
-        return Verdict.PASS, (
-            f"Mitigation engaged at request #{trip_request} "
-            f"(threshold={threshold}). Observed status {statuses[trip_index]}."
+        if expected == "log" and rule_hits:
+            return Verdict.PASS, (
+                f"Rate-limit rule {rule_id} logged {len(rule_hits)} event(s) "
+                f"during the probe burst (action=log; no HTTP mitigation expected)."
+            )
+
+        if expected == "log":
+            # Log-only rules may not change status codes — defer to correlator.
+            return None, ""
+
+        return Verdict.FAIL, (
+            f"Sent {len(statuses)} requests; no mitigation status "
+            f"({sorted(_MITIGATION_CODES)}) and no event for rule {rule_id}."
+        )
+
+    def manual_playbook(self, rule, config) -> str:
+        params = rule.extracted_params or {}
+        return (
+            f"Rule: {rule.description} ({rule.rule_id})\n"
+            f"Threshold: {params.get('requests_per_period')} / "
+            f"{params.get('period')}s, action {self.expected_action(rule)}\n"
+            f"Burst more than the threshold requests at the matching host/method, "
+            f"then confirm rule {rule.rule_id} in Security Events / Instant Logs."
         )
