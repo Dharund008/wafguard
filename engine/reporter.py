@@ -227,7 +227,7 @@ _TEMPLATE = Template(r"""<!DOCTYPE html>
 </html>""")
 
 
-FRAMEWORK_VERSION = "WAF Validation Framework v1.1"
+FRAMEWORK_VERSION = "WAF Validation Framework v1.1.0"
 
 
 def _detail_block(e: Evidence, outcomes: list | None = None) -> str:
