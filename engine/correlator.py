@@ -313,6 +313,23 @@ class Correlator:
                                 base.match_method = "ray_id"
                                 break
                 self._attach_events(base, rays, by_ray, prefer_rule_id=prefer)
+                # Own-probe rule_id match is the only SecEvt-verified path for
+                # score rules (and any adapter that passed prefer_rule_id).
+                if prefer is not None:
+                    own_rule_hits = [
+                        ev
+                        for r in rays
+                        for ev in by_ray.get(r, [])
+                        if ev.rule_id == prefer
+                    ]
+                    base.security_event_verified = bool(own_rule_hits)
+                    if own_rule_hits:
+                        base.match_method = "rule_id"
+                        base.matched_event_ids = list(dict.fromkeys(
+                            ev.ray_id for ev in own_rule_hits if ev.ray_id
+                        ))
+                        actions = {_norm_action(ev.action) for ev in own_rule_hits}
+                        base.action_taken = ", ".join(sorted(a for a in actions if a))
                 if base.security_event_verified and base.match_method == "status":
                     base.match_method = "ray_id"
                 if not base.action_taken:
@@ -330,7 +347,7 @@ class Correlator:
         for r in rays:
             matched_events.extend(by_ray.get(r, []))
 
-        # Prefer events that cite this exact rule id.
+        # Prefer events that cite this exact rule id on own-probe Rays.
         rule_matched = [ev for ev in matched_events if ev.rule_id == rule.rule_id]
         use_events = rule_matched or matched_events
 
@@ -344,7 +361,8 @@ class Correlator:
             ]
             base.action_taken = ", ".join(sorted(a for a in actions if a))
             base.match_method = "rule_id" if rule_matched else "ray_id"
-            base.security_event_verified = True
+            # Only count as security-event verified when THIS rule_id fired.
+            base.security_event_verified = bool(rule_matched)
 
             expected = base.expected_action
             if rule_matched:
@@ -421,17 +439,19 @@ class Correlator:
             matched.extend(by_ray.get(r, []))
         if prefer_rule_id:
             preferred = [ev for ev in matched if ev.rule_id == prefer_rule_id]
+            # When a specific rule_id is required, never list other rules'
+            # events as "matched" — that misled Medium WAF reports.
+            matched = preferred
             if preferred:
-                matched = preferred
                 evidence.security_event_verified = True
         if matched:
-            evidence.matched_event_ids = [
+            evidence.matched_event_ids = list(dict.fromkeys(
                 ev.ray_id for ev in matched if ev.ray_id
-            ]
-            evidence.timestamps = [
+            ))
+            evidence.timestamps = list(dict.fromkeys(
                 ev.datetime for ev in matched if ev.datetime
-            ]
+            ))
             actions = {_norm_action(ev.action) for ev in matched}
             evidence.action_taken = ", ".join(sorted(a for a in actions if a))
-            if any(ev.rule_id == prefer_rule_id for ev in matched):
+            if prefer_rule_id and any(ev.rule_id == prefer_rule_id for ev in matched):
                 evidence.security_event_verified = True
