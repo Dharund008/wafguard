@@ -75,19 +75,44 @@ _TEMPLATE = Template(r"""<!DOCTYPE html>
   .muted { color: var(--muted); }
   .tag { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); }
   footer { margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; }
+  .header-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  .header-row .titles { flex: 1; min-width: 220px; }
+  .btn-pdf {
+    flex-shrink: 0; cursor: pointer; border: 1px solid var(--border); background: var(--card2);
+    color: var(--text); border-radius: 8px; padding: 8px 14px; font-size: 13px; font-weight: 600;
+  }
+  .btn-pdf:hover { border-color: var(--accent); color: var(--accent); }
+  @media print {
+    * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    body { background: var(--bg); }
+    .wrap { max-width: none; margin: 0; padding: 12px; }
+    .no-print { display: none !important; }
+    tr.rowhead { cursor: default; }
+    tr.rowhead:hover td { background: transparent; }
+    .detail, .detail.open { display: table-row !important; }
+    .card, .cov-tree, .chk li, .rec, tr.rowhead, tr.detail {
+      break-inside: avoid; page-break-inside: avoid;
+    }
+    h2 { break-after: avoid; page-break-after: avoid; }
+  }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <h1>Cloudflare WAF Validation Report</h1>
-    <div class="meta">
-      Zone <code>{{ zone }}</code> &nbsp;·&nbsp; Target <code>{{ hostname }}</code>
-      &nbsp;·&nbsp; {{ generated }} &nbsp;·&nbsp; {{ framework }}
-      &nbsp;·&nbsp; API {{ api_status }}
-      &nbsp;·&nbsp; Evidence <code>{{ evidence_source or 'n/a' }}</code>
+    <div class="header-row">
+      <div class="titles">
+        <h1>Cloudflare WAF Validation Report</h1>
+        <div class="meta">
+          Zone <code>{{ zone }}</code> &nbsp;·&nbsp; Target <code>{{ hostname }}</code>
+          &nbsp;·&nbsp; {{ generated }} &nbsp;·&nbsp; {{ framework }}
+          &nbsp;·&nbsp; API {{ api_status }}
+          &nbsp;·&nbsp; Evidence <code>{{ evidence_source or 'n/a' }}</code>
+        </div>
+        {% if evidence_note %}<div class="meta" style="margin-top:6px">{{ evidence_note }}</div>{% endif %}
+      </div>
+      <button type="button" class="btn-pdf no-print" onclick="exportPdf()" title="Expand all details and open the print dialog (Save as PDF)">Export PDF</button>
     </div>
-    {% if evidence_note %}<div class="meta" style="margin-top:6px">{{ evidence_note }}</div>{% endif %}
   </header>
 
   <section class="cards">
@@ -177,6 +202,25 @@ _TEMPLATE = Template(r"""<!DOCTYPE html>
   function toggle(id) {
     var el = document.getElementById(id);
     if (el) el.classList.toggle('open');
+  }
+  function expandAllDetails() {
+    document.querySelectorAll('tr.detail').forEach(function (el) {
+      el.classList.add('open');
+    });
+  }
+  function collapseAllDetails() {
+    document.querySelectorAll('tr.detail').forEach(function (el) {
+      el.classList.remove('open');
+    });
+  }
+  function exportPdf() {
+    expandAllDetails();
+    window.addEventListener('afterprint', function onAfter() {
+      window.removeEventListener('afterprint', onAfter);
+      collapseAllDetails();
+    });
+    // Allow layout to settle with details open before the print dialog.
+    setTimeout(function () { window.print(); }, 50);
   }
 </script>
 </body>
