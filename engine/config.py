@@ -29,7 +29,7 @@ _DEFAULT_OPTIONS = {
     "hybrid_graphql_fill": True,
     "instant_logs_host_filter": False,
     "verify_ssl": True,
-    "user_agent": "WAF-Validator/1.0",
+    "user_agent": "WAF-Validator",
     "socks_proxy": None,
     # Pace probes so Instant Logs can deliver one line per request.
     "inter_request_delay": 0.25,

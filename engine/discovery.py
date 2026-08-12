@@ -437,8 +437,12 @@ class DiscoveryService:
         testable = False
         manual_reason = None
         if adapter_class:
+            # Tentative: adapter matched. Final testable is set by
+            # TestEngine.apply_preflight / can_execute against live config.
             adapter = get_adapter(adapter_class)
             testable = adapter is not None
+            if not testable:
+                manual_reason = f"Adapter {adapter_class} is registered but unavailable."
         else:
             manual_reason = "No adapter matches this rule expression."
 

@@ -149,7 +149,99 @@ class Correlator:
             ev = self._reconcile_one(result, by_ray, events)
             ev.evidence_source = source
             evidence.append(ev)
+
+        self._apply_allowlist_shadowing(results, evidence, by_ray)
         return evidence
+
+    @staticmethod
+    def _active_allowlist_skips(results: list[TestResult]) -> list[tuple[str, str, str]]:
+        """Allow/whitelist skip rules whose runner IP is a list member this run.
+
+        Returns list of (rule_id, description, list_name).
+        """
+        active: list[tuple[str, str, str]] = []
+        for result in results:
+            rule = result.rule
+            if (rule.rule_type or "") not in {"ip_whitelist", "ip_bypass"}:
+                continue
+            if _norm_action(result.expected_action) != "skip":
+                continue
+            params = rule.extracted_params or {}
+            if params.get("membership") not in {"member", "configured_match"}:
+                continue
+            active.append((
+                rule.rule_id,
+                rule.description or rule.rule_id,
+                params.get("list_name") or "?",
+            ))
+        return active
+
+    def _apply_allowlist_shadowing(
+        self,
+        results: list[TestResult],
+        evidence: list[Evidence],
+        by_ray: dict[str, list[FirewallEvent]],
+    ) -> None:
+        """Soft-MANUAL custom rules that cannot be proven while IP is allowlisted.
+
+        When the runner IP is on a whitelist/bypass list that skips remaining
+        custom rules, later custom rules often never evaluate. Downgrade
+        PASS-without-own-rule and FAIL to MANUAL with an ops note — do not
+        mutate Cloudflare lists.
+        """
+        active = self._active_allowlist_skips(results)
+        if not active:
+            return
+
+        active_ids = {rule_id for rule_id, _, _ in active}
+        label = "; ".join(
+            f"{desc} (${lst})" for _, desc, lst in active
+        )
+
+        for ev in evidence:
+            if ev.rule_id in active_ids:
+                continue
+            if ev.phase == "managed":
+                continue
+            if ev.security_event_verified:
+                continue
+            if ev.verdict not in {Verdict.FAIL, Verdict.PASS}:
+                continue
+
+            skip_on_rays = False
+            for ray in ev.cf_ray_ids:
+                for event in by_ray.get(ray, []):
+                    if (
+                        event.rule_id in active_ids
+                        and _norm_action(event.action) == "skip"
+                    ):
+                        skip_on_rays = True
+                        break
+                if skip_on_rays:
+                    break
+
+            # Membership alone is enough for unverified custom results: skip
+            # remaining means later custom rules are not independently testable.
+            # Prefer converting when we also saw allowlist skip on probe Rays,
+            # or when there were probe Rays at all (request reached the edge).
+            if not skip_on_rays and not ev.cf_ray_ids:
+                continue
+
+            prev = ev.verdict.value
+            prev_details = ev.details or ""
+            ev.verdict = Verdict.MANUAL
+            ev.match_method = "shadowed"
+            ev.details = (
+                f"Runner IP is on an allow/whitelist that skips remaining custom "
+                f"rules ({label}). This rule could not be independently verified "
+                f"in this run — remove the IP from the list and re-run.\n\n"
+                f"(Was {prev}) {prev_details}"
+            ).strip()
+            log.info(
+                "Allowlist shadowing: %s → MANUAL (%s)",
+                ev.rule_description or ev.rule_id,
+                label,
+            )
 
     @staticmethod
     def _merge_events(

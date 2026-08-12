@@ -40,6 +40,28 @@ class TestEngine:
         self.window_end: datetime | None = None
 
     # ------------------------------------------------------------------ #
+    def apply_preflight(self, rules: list[DiscoveredRule]) -> None:
+        """Set ``rule.testable`` from ``can_execute`` (current config), not
+        merely from whether an adapter class was classified.
+
+        Call ``compute_coverage`` on the same rule list used for execution
+        (phase-scoped) after this so report ``auto_testable`` matches evidence.
+        """
+        for rule in rules:
+            if not rule.enabled:
+                continue
+            adapter = get_adapter(rule.adapter_class) if rule.adapter_class else None
+            if adapter is None:
+                rule.testable = False
+                if not rule.manual_reason:
+                    rule.manual_reason = "No adapter is available for this rule type."
+                continue
+            executable, reason = adapter.can_execute(rule, self.config)
+            rule.testable = executable
+            if not executable:
+                rule.manual_reason = reason or adapter.manual_playbook(rule, self.config)
+
+    # ------------------------------------------------------------------ #
     def run(self, rules: list[DiscoveredRule]) -> list[TestResult]:
         results: list[TestResult] = []
         self.window_start = datetime.now(timezone.utc)
@@ -65,6 +87,7 @@ class TestEngine:
                 rule.manual_reason
                 or "No adapter is available for this rule type."
             )
+            rule.testable = False
             return TestResult(
                 rule=rule,
                 adapter_name="(none)",
@@ -75,14 +98,16 @@ class TestEngine:
 
         executable, reason = adapter.can_execute(rule, self.config)
         expected = adapter.expected_action(rule)
+        rule.testable = executable
 
         if not executable:
+            rule.manual_reason = reason or adapter.manual_playbook(rule, self.config)
             return TestResult(
                 rule=rule,
                 adapter_name=adapter.name,
                 expected_action=expected,
                 preflight_verdict=Verdict.MANUAL,
-                preflight_reason=reason or adapter.manual_playbook(rule, self.config),
+                preflight_reason=rule.manual_reason,
             )
 
         result = TestResult(

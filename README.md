@@ -34,7 +34,7 @@ Scoped API token with **read-only** permissions:
 | Zone → Firewall Services → Read | Zone WAF rule discovery |
 | Account → Account Rulesets / Account WAF → Read | Account WAF / rate-limit / managed discovery |
 | Zone → Analytics → Read | GraphQL `firewallEventsAdaptive` correlation |
-| Zone → Logs → Read | Instant Logs WebSocket (Business+ plans) |
+| Zone → Logs → Read | Instant Logs (`POST …/logpush/edge/jobs` WebSocket; Business+). Falls back to GraphQL if unavailable. |
 | Account → Account Filter Lists → Read | IP-list membership auto-detection |
 
 `account_id` is optional in config — resolved automatically from the zone.
@@ -58,6 +58,13 @@ impossible (e.g. Cloudflare Verified Bot spoofing).
 Reports show `evidence_source` and whether each rule was **security-event verified**
 (rule id / Ray match in the event stream).
 
+**Allow/whitelist skip:** If the runner IP is a member of a list used by a
+custom rule that **skips remaining custom rules**, later custom rules often
+never evaluate. The validator stays read-only: it does not remove list members.
+Those shadowed rules are reported as **MANUAL** with a note to remove the IP
+and re-run. Prove allow/whitelist membership in a dedicated run, then clear
+the IP before validating JSON content-type, bypass, score, and similar rules.
+
 ## Phases
 
 ```bash
@@ -67,8 +74,28 @@ waf-validator --config zones/myzone.yaml --phase ratelimit
 waf-validator --config zones/myzone.yaml            # all
 ```
 
+## GEO / Tor
+
+Geo-block probes need egress in a blocked country. Typical local setup:
+
+1. Install and run Tor (e.g. `brew install tor && brew services start tor`).
+2. Install PySocks: `pip install PySocks`.
+3. In the zone YAML:
+
+```yaml
+options:
+  socks_proxy: "socks5h://127.0.0.1:9050"
+```
+
+Without a listening SOCKS proxy, GEO stays MANUAL (or FAIL if `socks_proxy` is
+set but nothing accepts connections on that port).
+
 ## Output
 
 A self-contained `.html` file with summary cards, coverage (account vs zone),
 rule-by-rule results with evidence, manual playbooks, and recommendations.
 JSON is available for CI (`--format json|both`). Non-zero exit on any `FAIL`.
+
+In the HTML report, **Export PDF** expands all detail rows and opens the
+browser print dialog (Save as PDF). Re-run the validator to get a report that
+includes the button (older HTML files will not have it).
