@@ -120,7 +120,7 @@ _TEMPLATE = Template(r"""<!DOCTYPE html>
     <div class="card fail"><div class="n">{{ counts.FAIL }}</div><div class="l">Failed</div></div>
     <div class="card manual"><div class="n">{{ counts.MANUAL }}</div><div class="l">Manual</div></div>
     {% if counts.ERROR %}<div class="card fail"><div class="n">{{ counts.ERROR }}</div><div class="l">Errors</div></div>{% endif %}
-    <div class="card cov"><div class="n">{{ coverage_pct }}%</div><div class="l">Auto coverage</div></div>
+    <div class="card cov"><div class="n">{{ coverage_pct }}%</div><div class="l">Auto coverage (this run)</div></div>
   </section>
 
   <div class="bar">
@@ -130,9 +130,9 @@ _TEMPLATE = Template(r"""<!DOCTYPE html>
     <span style="width: {{ pct.ERROR }}%; background: var(--fail); opacity: 0.5;"></span>
   </div>
 
-  <h2>Coverage breakdown</h2>
+  <h2>Coverage breakdown (this run)</h2>
   <div class="cov-tree">
-    <div>Rules discovered: <b>{{ cov.total }}</b> (account <b>{{ cov.account }}</b> · zone <b>{{ cov.zone }}</b>)</div>
+    <div>Rules in scope: <b>{{ cov.total }}</b> (account <b>{{ cov.account }}</b> · zone <b>{{ cov.zone }}</b>)</div>
     <div>├── Enabled: <b>{{ cov.enabled }}</b></div>
     <div>│&nbsp;&nbsp;&nbsp;├── Auto-testable: <b>{{ cov.auto_testable }}</b></div>
     <div>│&nbsp;&nbsp;&nbsp;└── Manual / partial: <b>{{ cov.enabled - cov.auto_testable }}</b></div>
@@ -309,9 +309,8 @@ def render_html(
         "MANUAL": round(counts.get("MANUAL", 0) / executed * 100),
         "ERROR": round(counts.get("ERROR", 0) / executed * 100),
     }
-    # BUG 6 FIX: Coverage is auto-tested / auto-testable (from discovery),
-    # NOT (PASS+FAIL) / total_evidence (which includes MANUAL items and
-    # makes coverage look artificially low).
+    # Coverage % = auto-tested / auto-testable, where auto_testable is counted
+    # after can_execute preflight (not merely "adapter class exists").
     auto_tested = counts.get("PASS", 0) + counts.get("FAIL", 0)
     auto_testable = max(1, coverage.auto_testable) if coverage.auto_testable else max(1, auto_tested)
     coverage_pct = round(auto_tested / auto_testable * 100)

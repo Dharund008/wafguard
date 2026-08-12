@@ -158,17 +158,25 @@ def main(argv=None) -> int:
         return 4
 
     log.info("Discovered %s rules.", len(rules))
-    coverage = compute_coverage(rules)
 
     if "all" not in args.phase:
         rules_scoped = [r for r in rules if r.phase in args.phase]
     else:
         rules_scoped = rules
 
+    # Preflight against current config so auto_testable == can_execute, not
+    # merely "an adapter class exists". Coverage is scoped to this run's
+    # phase filter so auto % matches evidence (not the whole zone).
+    engine = TestEngine(cfg)
+    log.info("Running preflight (can_execute) for coverage…")
+    engine.apply_preflight(rules)
+    coverage = compute_coverage(rules_scoped)
+
     if args.dry_run:
         _print_plan(rules, args.phase)
         log.info(
-            "Coverage: total=%s enabled=%s auto_testable=%s account=%s zone=%s unknown=%s",
+            "Coverage (this run): total=%s enabled=%s auto_testable=%s "
+            "account=%s zone=%s unknown=%s",
             coverage.total, coverage.enabled, coverage.auto_testable,
             coverage.account, coverage.zone, coverage.unknown,
         )
@@ -221,8 +229,10 @@ def main(argv=None) -> int:
         log.info("Using GraphQL Analytics for event correlation (may be slower/sampled).")
 
     log.info("Executing tests (live)…")
-    engine = TestEngine(cfg)
     results = engine.run(rules_scoped)
+    # Refresh coverage for this run's scope after execution (can_execute may
+    # update flags, e.g. IP-list membership).
+    coverage = compute_coverage(rules_scoped)
 
     if il_active and il_session is not None:
         try:

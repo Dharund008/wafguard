@@ -8,7 +8,7 @@ version = "1.1.0"
 description = "Cloudflare WAF Validation Framework — discovers WAF rules, exercises them with targeted payloads, correlates against firewall events, and renders an evidence-backed report."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Proprietary" }
+license = { text = "MIT" }
 authors = [{ name = "AP Infrastructure / Presidio" }]
 dependencies = [
     "requests>=2.31.0",
