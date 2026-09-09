@@ -1,0 +1,7 @@
+{
+  "id": "waf-score-1",
+  "description": "WAF Attack Score - High",
+  "expression": "(cf.waf.score le 5)",
+  "action": "block",
+  "enabled": true
+}

@@ -151,6 +151,7 @@ class Correlator:
             evidence.append(ev)
 
         self._apply_allowlist_shadowing(results, evidence, by_ray)
+        self._apply_skip_shadowing(evidence, by_ray)
         return evidence
 
     @staticmethod
@@ -241,6 +242,72 @@ class Correlator:
                 "Allowlist shadowing: %s → MANUAL (%s)",
                 ev.rule_description or ev.rule_id,
                 label,
+            )
+
+    def _apply_skip_shadowing(
+        self,
+        evidence: list[Evidence],
+        by_ray: dict[str, list[FirewallEvent]],
+    ) -> None:
+        """Convert FAIL → SKIPPED when another rule's skip action explains it.
+
+        Generic detection: for any FAIL evidence whose observed actions include
+        'skip' from a different rule, identify that skip rule and convert the
+        verdict to SKIPPED with an explanation. This covers cases like an
+        "API Traffic Skip Bot Rule" suppressing bot-score enforcement.
+        """
+        # Build a lookup: rule_id → evidence (for naming the skip rule).
+        ev_by_rule: dict[str, Evidence] = {}
+        for ev in evidence:
+            ev_by_rule[ev.rule_id] = ev
+
+        for ev in evidence:
+            if ev.verdict != Verdict.FAIL:
+                continue
+            if not ev.cf_ray_ids:
+                continue
+
+            # Collect skip events from OTHER rules on this evidence's Ray IDs.
+            skip_rules: dict[str, str] = {}  # rule_id → description
+            for ray in ev.cf_ray_ids:
+                for event in by_ray.get(ray, []):
+                    if (
+                        _norm_action(event.action) == "skip"
+                        and event.rule_id
+                        and event.rule_id != ev.rule_id
+                    ):
+                        # Resolve the description from evidence or event.
+                        other_ev = ev_by_rule.get(event.rule_id)
+                        desc = (
+                            other_ev.rule_description
+                            if other_ev
+                            else event.description or event.rule_id
+                        )
+                        skip_rules[event.rule_id] = desc
+
+            if not skip_rules:
+                continue
+
+            # Convert FAIL → SKIPPED.
+            prev_details = ev.details or ""
+            skip_label = "; ".join(
+                f'"{desc}" ({rid})'
+                for rid, desc in skip_rules.items()
+            )
+            ev.verdict = Verdict.SKIPPED
+            ev.match_method = "skip_shadowed"
+            ev.details = (
+                f"Rule was not enforced because a prior skip rule suppressed "
+                f"evaluation on this target. Skip rule(s): {skip_label}. "
+                f"Expected action '{ev.expected_action}' was never applied; "
+                f"observed action(s) '{ev.action_taken}' are from the skip "
+                f"and other rules (e.g. log-all).\n\n"
+                f"(Was FAIL) {prev_details}"
+            ).strip()
+            log.info(
+                "Skip shadowing: %s → SKIPPED (caused by %s)",
+                ev.rule_description or ev.rule_id,
+                skip_label,
             )
 
     @staticmethod

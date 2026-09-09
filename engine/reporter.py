@@ -60,6 +60,7 @@ _TEMPLATE = Template(r"""<!DOCTYPE html>
   .badge { display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 12px; font-weight: 600; }
   .badge.PASS { color: var(--pass); background: var(--pass-bg); }
   .badge.FAIL { color: var(--fail); background: var(--fail-bg); }
+  .badge.SKIPPED { color: var(--skip); background: rgba(88,166,255,0.12); }
   .badge.MANUAL { color: var(--manual); background: var(--manual-bg); }
   .badge.ERROR { color: var(--fail); background: var(--fail-bg); }
   .detail { display: none; }
@@ -118,6 +119,7 @@ _TEMPLATE = Template(r"""<!DOCTYPE html>
   <section class="cards">
     <div class="card pass"><div class="n">{{ counts.PASS }}</div><div class="l">Passed</div></div>
     <div class="card fail"><div class="n">{{ counts.FAIL }}</div><div class="l">Failed</div></div>
+    {% if counts.SKIPPED %}<div class="card" style="border-left: 3px solid var(--skip);"><div class="n" style="color: var(--skip);">{{ counts.SKIPPED }}</div><div class="l">Skipped (by prior rule)</div></div>{% endif %}
     <div class="card manual"><div class="n">{{ counts.MANUAL }}</div><div class="l">Manual</div></div>
     {% if counts.ERROR %}<div class="card fail"><div class="n">{{ counts.ERROR }}</div><div class="l">Errors</div></div>{% endif %}
     <div class="card cov"><div class="n">{{ coverage_pct }}%</div><div class="l">Auto coverage (this run)</div></div>
@@ -126,6 +128,7 @@ _TEMPLATE = Template(r"""<!DOCTYPE html>
   <div class="bar">
     <span style="width: {{ pct.PASS }}%; background: var(--pass);"></span>
     <span style="width: {{ pct.FAIL }}%; background: var(--fail);"></span>
+    <span style="width: {{ pct.SKIPPED }}%; background: var(--skip);"></span>
     <span style="width: {{ pct.MANUAL }}%; background: var(--manual);"></span>
     <span style="width: {{ pct.ERROR }}%; background: var(--fail); opacity: 0.5;"></span>
   </div>
@@ -266,6 +269,15 @@ def _build_recommendations(evidence: list[Evidence], cov: CoverageStats,
             "text": f"FAILED — “{e.rule_description}”: {e.details} "
                     f"Investigate the rule expression and confirm it targets the tested path.",
         })
+    skipped = [e for e in evidence if e.verdict == Verdict.SKIPPED]
+    for e in skipped:
+        recs.append({
+            "level": "warn",
+            "text": f"SKIPPED — “{e.rule_description}”: Not enforced on this "
+                    f"target because a prior rule issued a skip action. This is expected if "
+                    f"the skip rule intentionally exempts this target. If enforcement is "
+                    f"required, review the skip rule’s scope.",
+        })
     for d in disabled:
         recs.append({
             "level": "warn",
@@ -306,6 +318,7 @@ def render_html(
     pct = {
         "PASS": round(counts.get("PASS", 0) / executed * 100),
         "FAIL": round(counts.get("FAIL", 0) / executed * 100),
+        "SKIPPED": round(counts.get("SKIPPED", 0) / executed * 100),
         "MANUAL": round(counts.get("MANUAL", 0) / executed * 100),
         "ERROR": round(counts.get("ERROR", 0) / executed * 100),
     }

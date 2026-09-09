@@ -1,0 +1,14 @@
+{
+  "id": "rl-1",
+  "description": "Global RateLimit",
+  "expression": "true",
+  "action": "managed_challenge",
+  "enabled": true,
+  "ratelimit": {
+    "characteristics": ["ip.src"],
+    "period": 10,
+    "requests_per_period": 100,
+    "mitigation_timeout": 10,
+    "counting_expression": ""
+  }
+}

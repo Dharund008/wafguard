@@ -1,0 +1,7 @@
+{
+  "id": "geo-1",
+  "description": "GEO Block",
+  "expression": "(ip.src.country in {\"CN\" \"RU\" \"T1\"})",
+  "action": "block",
+  "enabled": true
+}

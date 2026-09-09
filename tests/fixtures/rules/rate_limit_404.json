@@ -1,0 +1,14 @@
+{
+  "id": "rl-404",
+  "description": "404 RateLimit",
+  "expression": "true",
+  "action": "managed_challenge",
+  "enabled": true,
+  "ratelimit": {
+    "characteristics": ["ip.src"],
+    "period": 10,
+    "requests_per_period": 50,
+    "mitigation_timeout": 10,
+    "counting_expression": "http.response.code eq 404"
+  }
+}

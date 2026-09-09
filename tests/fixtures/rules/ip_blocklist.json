@@ -1,0 +1,7 @@
+{
+  "id": "ip-list-1",
+  "description": "AP BlockList",
+  "expression": "(ip.src in $ap_blacklist)",
+  "action": "block",
+  "enabled": true
+}

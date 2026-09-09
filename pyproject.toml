@@ -19,6 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 instant-logs = ["websockets>=12.0"]
+dev = ["pytest>=8"]
 
 [project.scripts]
 waf-validator = "waf_validator:main"
@@ -28,3 +29,7 @@ py-modules = ["waf_validator"]
 
 [tool.setuptools.packages.find]
 include = ["engine*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
