@@ -1,0 +1,10 @@
+[
+  {
+    "ray_id": "aabbccddeeff0011",
+    "action": "block",
+    "source": "firewallCustom",
+    "rule_id": "rule-1",
+    "description": "matched block",
+    "datetime": "2026-01-01T00:00:00Z"
+  }
+]

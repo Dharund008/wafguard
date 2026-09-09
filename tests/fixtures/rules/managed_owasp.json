@@ -1,0 +1,10 @@
+{
+  "id": "managed-owasp",
+  "description": "Cloudflare OWASP Core Ruleset",
+  "expression": "true",
+  "action": "execute",
+  "enabled": true,
+  "action_parameters": {
+    "id": "4814384a9e5d4991b9815dcfc25d2f1f"
+  }
+}

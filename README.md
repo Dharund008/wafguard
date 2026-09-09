@@ -99,3 +99,14 @@ JSON is available for CI (`--format json|both`). Non-zero exit on any `FAIL`.
 In the HTML report, **Export PDF** expands all detail rows and opens the
 browser print dialog (Save as PDF). Re-run the validator to get a report that
 includes the button (older HTML files will not have it).
+
+## Dev: running tests
+
+Offline unit tests (no host probes, no Cloudflare API):
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+`pytest` is a **dev-only** optional dependency — not required to run `waf-validator`.

@@ -1,0 +1,7 @@
+{
+  "id": "unknown-1",
+  "description": "Exotic custom",
+  "expression": "(cf.random_field eq \"x\")",
+  "action": "block",
+  "enabled": true
+}

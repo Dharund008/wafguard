@@ -29,3 +29,8 @@ engine/testers/managed_ruleset.py
 engine/testers/rate_limit.py
 engine/testers/verified_bot.py
 engine/testers/waf_score.py
+tests/test_adapters_preflight.py
+tests/test_classify.py
+tests/test_correlator.py
+tests/test_coverage.py
+tests/test_reporter_coverage.py

@@ -19,6 +19,7 @@ class Verdict(str, Enum):
     """Outcome of validating a single rule."""
     PASS = "PASS"
     FAIL = "FAIL"
+    SKIPPED = "SKIPPED"
     MANUAL = "MANUAL"
     ERROR = "ERROR"
 
